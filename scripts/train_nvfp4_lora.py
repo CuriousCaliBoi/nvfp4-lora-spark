@@ -83,6 +83,11 @@ from nvfp4_lora.loader import (  # noqa: E402
     replace_bf16_targets,
     replace_nvfp4_modules,
 )
+from nvfp4_lora.training_utils import (  # noqa: E402
+    load_step_callback,
+    resolve_callback_cadence,
+    run_step_callback,
+)
 
 # The family registry (FAMILIES / resolve_family) lives in nvfp4_lora/families.py
 # and is shared with the loader, the checkpoint inspector and the merge scripts.
@@ -1130,6 +1135,17 @@ def main():
                          "best triggers a confirming FULL eval; only the full value "
                          "updates best tracking. 0 means every eval is full.")
     ap.add_argument("--checkpoint-every", type=int, default=50)
+    ap.add_argument("--callback-module", default=None,
+                    help="Optional dotted module path OR path to a .py file exposing "
+                         "on_step(step, model, tokenizer, output_dir). Called on the "
+                         "callback cadence (see --callback-every) with the live model, so an "
+                         "out-of-tree monitor (e.g. persona-vector drift) can read the "
+                         "current weight-state. Any exception it raises is logged and "
+                         "swallowed; it can never abort the run. Default: no callback.")
+    ap.add_argument("--callback-every", type=int, default=0,
+                    help="Cadence (in update steps) for --callback-module. 0 (default) "
+                         "means follow --checkpoint-every, so the callback reads exactly the "
+                         "weight-states that get checkpointed.")
     ap.add_argument("--final-save-timeout", type=float, default=900.0,
                     help="Seconds to allow the final root-dir adapter save before "
                          "abandoning it and hard-exiting (best/ and the last checkpoint "
@@ -1192,6 +1208,18 @@ def main():
             fh.write(json.dumps(rec, sort_keys=True) + "\n")
 
     log("config", **vars(args))
+
+    # Optional out-of-tree per-step callback (e.g. a persona-drift monitor). Loaded ONCE,
+    # defensively: a broken or missing --callback-module is logged and disabled, never fatal.
+    # It fires on --callback-every (0 => the --checkpoint-every cadence).
+    callback_cadence = resolve_callback_cadence(args.callback_every, args.checkpoint_every)
+    step_callback = None
+    if args.callback_module:
+        try:
+            step_callback = load_step_callback(args.callback_module)
+            log("step_callback_loaded", module=args.callback_module, every=callback_cadence)
+        except Exception as e:  # noqa: BLE001 - a bad callback module must not kill the run
+            log("step_callback_load_failed", module=args.callback_module, error=repr(e))
 
     model_dir = Path(args.model_dir)
     model_type, family = resolve_family(
@@ -1876,6 +1904,13 @@ def main():
                     _save_train_state(ckpt_dir, optim, sched, update_step, epoch)
                     _rotate_checkpoints(Path(args.output_dir), keep=2)
                     log("checkpoint_done", step=update_step)
+
+                # Fire the out-of-tree monitor on its cadence, reading the current (just
+                # possibly checkpointed) weight-state. Fully crash-isolated by run_step_callback.
+                if (step_callback is not None and callback_cadence > 0
+                        and update_step % callback_cadence == 0):
+                    run_step_callback(step_callback, log, step=update_step, model=model,
+                                      tokenizer=tok, output_dir=args.output_dir)
 
                 if args.max_steps is not None and update_step >= args.max_steps:
                     break
