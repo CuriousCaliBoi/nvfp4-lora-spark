@@ -1234,6 +1234,47 @@ def assert_no_meta_tensors(model: nn.Module, allowed_prefixes: Sequence[str] = (
 # Top-level entry
 # --------------------------------------------------------------------------------------
 
+def ensure_recursive_remote_code_imports() -> None:
+    """Work around a transformers dynamic-module cache gap for multi-level custom code.
+
+    `get_cached_module_file` stages a trust_remote_code modeling file plus the module
+    names returned by `check_imports` -- which are the DIRECT relative imports only. But
+    `get_class_in_module` then resolves the import graph RECURSIVELY. A 2-level custom-code
+    import chain therefore leaves a transitively-imported sibling un-staged and raises
+    `FileNotFoundError` at import time. Puzzle is the first onboarded checkpoint that trips
+    this: `modeling_nemotron_h_puzzle` imports `modeling_nemotron_h` and
+    `configuration_nemotron_h_puzzle`, both of which import `configuration_nemotron_h`, so
+    the base config file is never copied into the modeling cache dir (verified on
+    transformers 5.8.1; the base nemotron_h Nano/Super checkpoints only have a 1-level chain
+    and are unaffected).
+
+    Patch `check_imports` to return the FULL recursive closure of relative-import module
+    basenames. This is a strict superset of the current return value, so it is a no-op for
+    single-level custom code and for built-in models, and it preserves the original
+    missing-pip-package check by delegating to it first. Assumes the flat single-directory
+    layout the Hub enforces for remote code (all relative imports live beside the modeling
+    file), which is exactly Puzzle's layout. Idempotent.
+    """
+    import os
+    import transformers.dynamic_module_utils as _dmu
+
+    if getattr(_dmu.check_imports, "_nvfp4_recursive", False):
+        return
+    _orig_check_imports = _dmu.check_imports
+
+    def _recursive_check_imports(filename):
+        direct = _orig_check_imports(filename)  # keeps the missing-package check + its raise
+        try:
+            files = _dmu.get_relative_import_files(filename)  # recursive absolute paths
+        except Exception:
+            return direct
+        stems = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        return list(dict.fromkeys(list(direct) + stems))
+
+    _recursive_check_imports._nvfp4_recursive = True
+    _dmu.check_imports = _recursive_check_imports
+
+
 def load_nemotron_with_nvfp4_lora(
     model_dir: str | Path,
     target_lora_suffixes: Sequence[str] = ("q_proj", "v_proj"),
@@ -1265,6 +1306,7 @@ def load_nemotron_with_nvfp4_lora(
     device = torch.device(device)
     model_dir = Path(model_dir)
 
+    ensure_recursive_remote_code_imports()  # multi-level trust_remote_code chains (Puzzle)
     config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, torch_dtype=dtype)

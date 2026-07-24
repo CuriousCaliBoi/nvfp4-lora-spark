@@ -316,6 +316,21 @@ FAMILIES: dict[str, dict] = {
 FAMILIES["qwen3_5_moe_text"] = FAMILIES["qwen3_5_moe"]
 FAMILIES["mistral4"] = FAMILIES["mistral3"]
 
+# Puzzle-75B-A9B (NVIDIA "Puzzle" NAS block-substitution search over a Nemotron-H hybrid
+# Mamba/Attention/MoE backbone). Same on-disk layout as nemotron_h -- backbone.* prefix,
+# per-expert (non-fused) NVFP4 Linears, mtp.* skipped, dynamic backbone/model prefix probe
+# in the loader's fallback translator (st_to_model=None). Confirmed by direct inspection of
+# modeling_nemotron_h_puzzle.py (a thin NemotronHBlock/NemotronHForCausalLM subclass that
+# only swaps in a per-layer NemotronHConfig via config.block_configs) and by a meta-build of
+# the real checkpoint under transformers 5.8.1 (44,539,891,200 params across 88 heterogeneous
+# layers: 40 mamba / 40 moe / 8 attention; hidden_size constant 4096; lm_head untied). The NAS
+# heterogeneity (per-MoE-layer moe_intermediate_size in {1280,1536,1792,2048,2688,...},
+# num_experts_per_tok in 4..18, latent-space MoE with moe_latent_size=1024) is per-module shape
+# variance the loader already handles (in_features/out_features come off the constructed
+# nn.Linear, never a global config value) -- it costs nothing here. Alias rather than a copied
+# literal so the two layouts cannot silently drift apart.
+FAMILIES["nemotron_h_puzzle"] = FAMILIES["nemotron_h"]
+
 
 def model_type_from_config(model_dir: str | Path) -> str | None:
     """Read `model_type` straight from config.json.

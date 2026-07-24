@@ -79,6 +79,7 @@ from nvfp4_lora.loader import (  # noqa: E402
     _assign_dequant_workspaces,
     assert_no_meta_tensors,
     decide_lora_mode,
+    ensure_recursive_remote_code_imports,
     load_non_nvfp4_weights,
     replace_bf16_targets,
     replace_nvfp4_modules,
@@ -339,6 +340,10 @@ def load_model(
     # view is the identity), so nothing below changes for them.
     is_vision = family.get("_train_target") == "vision"
     is_both = family.get("_train_target") == "both"
+    # Puzzle's custom modeling code has a 2-level relative-import chain that transformers'
+    # dynamic-module cache stages incompletely; make check_imports recursive first (no-op
+    # for single-level custom code and built-in models).
+    ensure_recursive_remote_code_imports()
     cfg = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
     # Some multimodal families (e.g. NemotronH-Omni) declare NO Flash-Attention-2 support and
     # default to it, so from_config raises unless we force eager. The family opts in via

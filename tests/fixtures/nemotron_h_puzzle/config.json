@@ -1,0 +1,8 @@
+{
+  "architectures": ["NemotronHPuzzleForCausalLM"],
+  "model_type": "nemotron_h_puzzle",
+  "hidden_size": 4096,
+  "moe_latent_size": 1024,
+  "tie_word_embeddings": false,
+  "layers_block_type": ["mamba", "moe", "attention", "mamba", "moe"]
+}
