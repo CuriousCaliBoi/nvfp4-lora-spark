@@ -68,14 +68,17 @@ def _fp8_storage(out_f, in_f, per_channel=False, seed=0):
     return {"weight": w, "weight_scale": scale}
 
 
-def _write_ckpt(tmp_path, in_f, out_f, fp8_per_channel=False):
+def _write_ckpt(tmp_path, in_f, out_f, fp8_per_channel=False, frozen_fp8_per_channel=False):
     shard = "model-00001-of-00001.safetensors"
     tensors = {}
     for k, v in _nvfp4_storage(out_f, in_f, seed=1).items():
         tensors[f"backbone.layers.0.attn.q_proj.{k}"] = v
     for k, v in _fp8_storage(out_f, in_f, per_channel=fp8_per_channel, seed=2).items():
         tensors[f"backbone.layers.0.attn.v_proj.{k}"] = v
-    for k, v in _fp8_storage(out_f, in_f, seed=3).items():
+    # o_proj is the FROZEN (non-LoRA-target) FP8 module. `frozen_fp8_per_channel` gives it a
+    # per-output-channel (out,) scale -- the shape that trips the loader's frozen-dequant
+    # .item() (Puzzle's lm_head + attn q/k/v/o_proj).
+    for k, v in _fp8_storage(out_f, in_f, per_channel=frozen_fp8_per_channel, seed=3).items():
         tensors[f"backbone.layers.0.attn.o_proj.{k}"] = v
     save_file(tensors, str(tmp_path / shard))
     index = {"weight_map": {k: shard for k in tensors}}
@@ -167,6 +170,41 @@ def test_pooled_fp8_lora_per_channel_scale(tmp_path):
         x, v.weight_fp8.to(torch.float32) * v.weight_scale  # (out,1) broadcast over in
     )
     assert torch.allclose(v(x), base, atol=1e-5)
+
+
+def test_pooled_frozen_fp8_per_channel_scale(tmp_path):
+    """FROZEN (non-LoRA-target) FP8 with a per-output-channel (out,) weight_scale must
+    dequant without the old scalar `.item()` crash (Puzzle lm_head + q/k/v/o_proj) and
+    broadcast the per-row scale correctly. Exercises replace_nvfp4_modules_pooled's
+    frozen-FP8 branch."""
+    model, counts = _build(tmp_path, frozen_fp8_per_channel=True)  # o_proj frozen, per-channel
+    o = model.backbone.layers[0].attn.o_proj
+    assert isinstance(o, nn.Linear) and o.weight.requires_grad is False
+    assert counts["frozen_fp8"] == 1
+
+    # Dequant equals w_fp8 * scale[:, None] (per-row), computed from the same seeded storage.
+    st = _fp8_storage(o.out_features, o.in_features, per_channel=True, seed=3)
+    expected = st["weight"].to(torch.float32) * st["weight_scale"].reshape(-1, 1)
+    assert torch.allclose(o.weight.to(torch.float32), expected.to(o.weight.dtype).to(torch.float32), atol=1e-5)
+
+
+def test_nonpooled_frozen_fp8_per_channel_scale(tmp_path):
+    """Same per-channel frozen-FP8 dequant, but through the NON-pooled
+    replace_nvfp4_modules path (the second patched site)."""
+    from nvfp4_lora.loader import replace_nvfp4_modules
+
+    in_f, out_f = 32, 8
+    _write_ckpt(tmp_path, in_f, out_f, frozen_fp8_per_channel=True)
+    model = _TinyBackbone(in_f, out_f)
+    counts = replace_nvfp4_modules(
+        model, tmp_path, target_lora_suffixes=("q_proj", "v_proj"),
+        r=4, lora_alpha=8, device=CPU, dtype=torch.float32,
+    )  # o_proj is frozen FP8 with a per-channel scale -> must not raise
+    o = model.backbone.layers[0].attn.o_proj
+    assert isinstance(o, nn.Linear) and o.weight.requires_grad is False
+    st = _fp8_storage(out_f, in_f, per_channel=True, seed=3)
+    expected = st["weight"].to(torch.float32) * st["weight_scale"].reshape(-1, 1)
+    assert torch.allclose(o.weight.to(torch.float32), expected.to(torch.float32), atol=1e-5)
 
 
 def test_pooled_fp8_lora_views_share_pool_storage(tmp_path):

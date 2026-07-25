@@ -739,9 +739,17 @@ def replace_nvfp4_modules(
                 counts["lora_fp8"] += 1
                 counts["lora"] += 1
             else:
-                # Frozen: dequant to a plain bf16 Linear (no LoRA).
-                scale = float(w_scale.to(torch.float32).item())
-                W = w_tensor.to(torch.float32).mul_(scale).to(dtype=dtype, device=device).contiguous()
+                # Frozen: dequant to a plain bf16 Linear (no LoRA). weight_scale may be a
+                # per-tensor scalar OR a per-output-channel (out_features,) vector: Puzzle's
+                # FP8_PER_CHANNEL_PER_TOKEN modules (lm_head, attention q/k/v/o_proj) use the
+                # latter, and .item() raises on a vector. Normalize instead of assuming scalar,
+                # mirroring FP8LoRALinear's own per-channel handling.
+                w_scale_f32 = w_scale.to(torch.float32)
+                if w_scale_f32.ndim >= 1 and w_scale_f32.numel() == out_features:
+                    w_scale_f32 = w_scale_f32.reshape(out_features, 1)
+                else:
+                    w_scale_f32 = w_scale_f32.reshape(())
+                W = w_tensor.to(torch.float32).mul(w_scale_f32).to(dtype=dtype, device=device).contiguous()
                 new_mod = nn.Linear(in_features, out_features, bias=(bias is not None), device=device, dtype=dtype)
                 with torch.no_grad():
                     new_mod.weight.copy_(W)
@@ -1052,8 +1060,15 @@ def replace_nvfp4_modules_pooled(
             offsets["fp8"] += _numel(rec.weight_shape)
             w_tensor = load_tensor(model_dir, rec.weight_key, wm)
             w_scale = load_tensor(model_dir, rec.scale_key, wm)
-            scale = float(w_scale.to(torch.float32).item())
-            weight_view.copy_(w_tensor.to(torch.float32).mul_(scale).to(dtype=dtype))
+            # weight_scale may be per-tensor scalar OR per-output-channel (out_features,)
+            # vector (Puzzle FP8_PER_CHANNEL_PER_TOKEN: lm_head, q/k/v/o_proj); .item() raises
+            # on a vector. Normalize like FP8LoRALinear instead of assuming scalar.
+            w_scale_f32 = w_scale.to(torch.float32)
+            if w_scale_f32.ndim >= 1 and w_scale_f32.numel() == rec.out_features:
+                w_scale_f32 = w_scale_f32.reshape(rec.out_features, 1)
+            else:
+                w_scale_f32 = w_scale_f32.reshape(())
+            weight_view.copy_(w_tensor.to(torch.float32).mul(w_scale_f32).to(dtype=dtype))
 
             new_mod = nn.Linear(
                 rec.in_features, rec.out_features, bias=(bias is not None), device="meta", dtype=dtype
