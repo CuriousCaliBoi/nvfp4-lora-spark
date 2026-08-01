@@ -72,6 +72,54 @@ MAX_JOBS=1 pip install --no-build-isolation causal-conv1d==1.6.2.post1
 `MAX_JOBS=1` is mandatory on Spark to prevent nvcc from being OOM-killed
 during parallel compilation on the 128 GB unified pool.
 
+## `mamba-ssm` for NemotronH-family checkpoints (needs a source patch)
+
+Only needed if you are training or capturing on a NemotronH-family
+checkpoint (`nemotron_h`, `nemotron_h_puzzle`, or a NemotronH-Omni
+wrapper). Their custom modeling code imports `mamba_ssm` for the Mamba2
+mixer layers. Other families do not import it at all.
+
+```bash
+pip install --no-build-isolation mamba-ssm==2.2.5
+python scripts/patch_mamba_ssm.py
+```
+
+The install is triton-only: `selective_scan_cuda` is a Mamba-1 CUDA
+extension that is not built here and is not needed, because these
+checkpoints run the Mamba2 triton path. Two upstream assumptions in
+mamba-ssm 2.2.5 then make `import mamba_ssm` fail outright even though
+every submodule the model actually touches (`mamba_ssm.ops.triton.*`)
+imports fine:
+
+1. `ops/selective_scan_interface.py` does a bare top-level
+   `import selective_scan_cuda`.
+2. `__init__.py` eagerly imports the full Mamba-1/Mamba-2 model stack,
+   which pulls in (1) and additionally reaches for transformers-4.x
+   generation symbols that transformers 5.x removed.
+
+`scripts/patch_mamba_ssm.py` wraps both in try/except with a `None`
+fallback. It is idempotent and safe to run unconditionally. Nothing that
+worked before stops working: on an install that does have
+`selective_scan_cuda` built, both try-blocks succeed and module state is
+identical to upstream.
+
+**These are in-place edits to installed site-packages, so any
+`pip install -U mamba-ssm` or venv rebuild silently reverts them.** Model
+loads then fail at import time, which on a large checkpoint means burning
+the load before you find out. Re-run the patcher after any upgrade, or
+gate your run on the check mode, which writes nothing and exits 3 if a
+patch is missing:
+
+```bash
+python scripts/patch_mamba_ssm.py --check
+```
+
+Use `--dry-run` to see the exact diff, and `--package-dir` to target a
+different venv's `site-packages/mamba_ssm`. If the patcher does not
+recognize the installed source it fails loudly (exit 2) rather than
+reporting a false success, so a future mamba-ssm release cannot leave you
+believing you are patched when you are not.
+
 ## Model artifacts
 
 | Artifact | Source | Hash |

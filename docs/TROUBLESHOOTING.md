@@ -127,6 +127,49 @@ and training is effectively infeasible at any useful sequence length.
 The `MAX_JOBS=1` cap prevents nvcc from being OOM-killed during
 parallel compilation on the 128 GB unified pool.
 
+### `ModuleNotFoundError: No module named 'selective_scan_cuda'` loading a NemotronH-family checkpoint
+
+**Also seen as**: an `ImportError` out of
+`mamba_ssm/__init__.py` naming a transformers symbol that no longer
+exists (`GenerationMixin` internals, `load_config_hf`, and friends), on
+any `nemotron_h`, `nemotron_h_puzzle` or NemotronH-Omni load.
+
+**Cause**: mamba-ssm 2.2.5 assumes the Mamba-1 CUDA extension is built
+and eagerly imports its full Mamba-1/Mamba-2 model stack from
+`__init__.py`. On a triton-only install under transformers 5.x both
+assumptions are false, so `import mamba_ssm` fails even though the
+Mamba2 triton path these checkpoints actually run is fine. The failure
+lands at model-import time, which on a large checkpoint means you find
+out after paying for part of the load.
+
+**Fix**: `python scripts/patch_mamba_ssm.py`. It guards both imports in
+place, is idempotent, and is a no-op on an install that does have the
+extension. See the setup section in
+[REPRODUCE.md](../REPRODUCE.md#mamba-ssm-for-nemotronh-family-checkpoints-needs-a-source-patch).
+
+**If it comes back**: the patcher edits installed site-packages, so a
+`pip install -U mamba-ssm` or a venv rebuild reverts it. Add
+`python scripts/patch_mamba_ssm.py --check` (writes nothing, exit 3 if a
+patch is missing) to your preflight so the next revert costs a second
+instead of a load.
+
+### `FileNotFoundError` for a `configuration_*.py` under `~/.cache/huggingface/modules/transformers_modules/...`
+
+**Cause**: a `trust_remote_code` checkpoint whose custom code has a
+multi-level relative-import chain. transformers stages the modeling file
+plus its DIRECT relative imports into the dynamic-module cache, but
+resolves the import graph recursively at import time, so a
+transitively-imported sibling is never copied in. Puzzle-75B is the
+first onboarded checkpoint with a 2-level chain
+(`modeling_nemotron_h_puzzle` to `modeling_nemotron_h` to
+`configuration_nemotron_h`); single-level custom code is unaffected.
+
+**Fix**: already handled. `ensure_recursive_remote_code_imports()` in
+[`nvfp4_lora/loader.py`](../nvfp4_lora/loader.py) widens
+`check_imports` to the full recursive closure and is called before the
+loader's and the trainer's `Auto*` builds. If you build a model outside
+those two entry points, call it yourself first.
+
 ### `NVRM: ... Out of memory [NV_ERR_NO_MEMORY] ... _memdescAllocInternal` during model load
 
 **Signature**: dozens to hundreds of `NV_ERR_NO_MEMORY` lines in

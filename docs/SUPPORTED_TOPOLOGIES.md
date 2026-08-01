@@ -38,8 +38,15 @@ multimodal-tower skip lists, fused-MoE class names) lives in ONE registry:
 | `qwen3_5_moe` / `qwen3_5_moe_text` | causal LM | NVFP4 q/k/v/o on full-attention layers (native LoRA); GatedDeltaNet linear-attention layers BF16 | per-expert CT keys, fused-3D in memory (`Qwen3_5MoeExperts`) | trained + runtime-LoRA served end-to-end (logprob-delta confirmed). NB: the 122B checkpoint is a vision-wrapped `...ForConditionalGeneration`, so the expert/attn adapter must be re-keyed to the `language_model.model.layers.N` path (`rekey_expert_lora_for_vllm.py --wrapped auto`); see `cross_arch_status.md` FINDING #3 |
 | `mistral3` / `mistral4` | image-text-to-text (vision tower frozen + unmaterialized) | MLA attention BF16 (PEFT LoRA) | per-expert CT keys, fused-3D in memory (`Mistral4NaiveMoe`) | trained end-to-end |
 | `nemotron_h` (Nemotron-3 Nano/Super) | causal LM | BF16/FP8 (not LoRA-targeted) | per-expert ModelOpt keys, per-expert in memory (no fused-3D container; `st_to_model`/`expert_prefix`/`moe_experts_class` are None and the loader's dynamic prefix heuristic applies, since Nano materializes `backbone.*` but Super `model.*`) | unified trainer (validated: Nano dry-run + 3-step smoke); `train/*.py` remain the frozen v1.0 measurement-run path |
+| `nemotron_h_puzzle` (Puzzle-75B-A9B) | causal LM | FP8 per-channel on q/k/v/o_proj and `lm_head` (LoRA-targetable via `FP8LoRALinear`) | per-expert ModelOpt keys, per-expert in memory; NAS-heterogeneous per-layer `moe_intermediate_size` and `num_experts_per_tok`, latent-space MoE at `moe_latent_size` 1024 | registered as a straight alias of `nemotron_h` (byte-identical on-disk layout). Validated on one GB10: dry-run load (41,153 modules replaced, 882M trainable, loss 13.49, peak 62.8 GB) + 3-step smoke (losses 1.61 / 1.41 / 1.65, checkpoint and `train_state` written, peak ~47 GB). Loads cost ~86-91 min, dominated by the per-expert module replacements |
 
 A `model_type` outside the registry is a hard error naming the registry file.
+
+NemotronH-family entries (`nemotron_h`, `nemotron_h_puzzle`, the
+NemotronH-Omni wrappers) import `mamba_ssm` for their Mamba2 mixer
+layers, which needs a one-time source patch in a triton-only venv:
+see [REPRODUCE.md](../REPRODUCE.md#mamba-ssm-for-nemotronh-family-checkpoints-needs-a-source-patch)
+and `scripts/patch_mamba_ssm.py`.
 
 ### Serving routed-expert (MoE) LoRA: backend-gated, not merge-only
 
