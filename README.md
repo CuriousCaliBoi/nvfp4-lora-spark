@@ -142,8 +142,10 @@ identical logprobs *prove* the adapter is a no-op; a moved delta proves it appli
 The experimental local GRPO route trains attention LoRA adapters against a frozen
 Nemotron NVFP4 checkpoint, using vLLM rollouts from the same checkpoint. See
 [the GRPO runner and learning contract](docs/GRPO.md) and
-[the DGX Spark experiment instructions](docs/SPARK_GRPO.md). The implementation
-and CPU checks are available; the full DGX Spark experiment outcome is pending.
+[the DGX Spark experiment instructions](docs/SPARK_GRPO.md). A recorded DGX Spark
+smoke completed one update and verified adapter reload. Its
+[measured results](docs/GRPO_SMOKE.md) include unchanged strict evaluation
+scores and the flexible verifier's limitation.
 
 ## On-ramp: reproduce a real before/after in ~30 minutes (public 8B)
 
