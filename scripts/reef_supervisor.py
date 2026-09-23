@@ -66,7 +66,7 @@ def actor_argv(args, image_id, owner):
             "--max-num-batched-tokens", "1024", "--max-num-seqs", "32",
             "--moe-backend", "marlin", "--mamba-backend", "flashinfer", "--mamba-cache-mode", "align",
             "--kv-cache-dtype", "fp8", "--enable-lora", "--max-lora-rank", "8",
-            "--max-loras", "2", "--max-cpu-loras", "16", "--no-enable-prefix-caching",
+            "--max-loras", "2", "--max-cpu-loras", "16", "--no-enable-prefix-caching", "--no-async-scheduling",
             "--logprobs-mode", "processed_logprobs", "--generation-config", "vllm", "--no-enable-log-requests"]
 
 
@@ -131,6 +131,8 @@ def actor_attestation(inspected, owner, revision, version):
         raise ValueError("inspected actor command violates the controlled sampling contract")
     if any("speculative" in x for x in argv) or "--no-enable-prefix-caching" not in argv:
         raise ValueError("speculation and prefix caching must be disabled")
+    if "--no-async-scheduling" not in argv or "--async-scheduling" in argv:
+        raise ValueError("the controlled actor profile requires asynchronous scheduling disabled")
     if int(value("--max-cpu-loras") or 0) < 16 or version != "0.27.1":
         raise ValueError("unsupported actor version or insufficient adapter capacity")
     if inspected["Config"].get("Labels", {}).get("nvfp4-reef.owner") != owner:
@@ -141,7 +143,8 @@ def actor_attestation(inspected, owner, revision, version):
     return {"schema_version": 1, "actor_instance_id": owner, "container_id": inspected["Id"],
             "image_id": inspected["Image"], "base_model": MODEL, "model_revision": revision,
             "vllm_version": version, "logprobs_mode": "processed_logprobs", "generation_config": "vllm",
-            "speculative_decoding": False, "exclusive_adapter_control": True, "command": argv}
+            "speculative_decoding": False, "async_scheduling": False,
+            "exclusive_adapter_control": True, "command": argv}
 
 
 class Supervisor:

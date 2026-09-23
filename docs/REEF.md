@@ -86,6 +86,8 @@ After reviewing the commands, omit `--dry-run` to execute. Native execution is a
 
 The owned actor uses 23% GPU allocation, eager execution, context 1024, no speculative draft, no prefix caching, rank8 LoRA and processed log probabilities. `--generation-config vllm` prevents hidden checkpoint sampling defaults. Runtime adapter updates are enabled only on the owned loopback actor. Its attestation is built from the inspected Docker command and actual vLLM version endpoint. Native numerical tests still have to prove that the loaded adapter changes probabilities and that an independent alias reload reproduces them.
 
+The research profile explicitly sets `--no-async-scheduling` and records `async_scheduling: false` in the inspected actor contract. This tests the scheduling hypothesis behind the native probability discrepancy; it is not evidence that the discrepancy is fixed. Marlin, FP8 KV cache, FlashInfer Mamba, maximum 32 sequences and 23% memory allocation remain unchanged. All parity, effect and reload gates retain their existing thresholds.
+
 Workers run as the host UID/GID, with read-only code/model mounts, offline Hugging Face settings and writable cache/home directories. The absolute `learning/checkpoints` path is identical in the CPU service, worker and actor; the actor receives it read-only. Each worker has a unique name, ownership label, CID file and registry entry. Only the supervisor controls production lifecycle.
 
 ## Campaign, restart and rollback

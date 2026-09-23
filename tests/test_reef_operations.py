@@ -43,16 +43,19 @@ def test_actor_attestation_uses_inspected_command(settings):
     item = inspected_actor(settings, "owner")
     assert "--no-enable-log-requests" in item["Args"]
     assert "--disable-log-requests" not in item["Args"]
+    assert "--no-async-scheduling" in item["Args"]
     result = ops.actor_attestation(item, "owner", "abc", "0.27.1")
     assert result["command"] == [item["Path"], *item["Args"]]
     assert result["container_id"] == "actor-id"
     assert result["speculative_decoding"] is False
+    assert result["async_scheduling"] is False
     item["Args"][item["Args"].index("processed_logprobs")] = "raw_logprobs"
     with pytest.raises(ValueError, match="controlled sampling"):
         ops.actor_attestation(item, "owner", "abc", "0.27.1")
 
 
-@pytest.mark.parametrize("mutation", ["speculation", "version", "owner", "runtime-loading", "capacity"])
+@pytest.mark.parametrize("mutation", ["speculation", "version", "owner", "runtime-loading", "capacity",
+                                     "async-default", "async-enabled"])
 def test_actor_attestation_rejects_unreviewed_actor(settings, mutation):
     item = inspected_actor(settings, "owner")
     version = "0.27.1"
@@ -66,6 +69,10 @@ def test_actor_attestation_rejects_unreviewed_actor(settings, mutation):
         item["Config"]["Env"] = []
     if mutation == "capacity":
         item["Args"][item["Args"].index("--max-cpu-loras") + 1] = "2"
+    if mutation == "async-default":
+        item["Args"].remove("--no-async-scheduling")
+    if mutation == "async-enabled":
+        item["Args"].append("--async-scheduling")
     with pytest.raises(ValueError):
         ops.actor_attestation(item, "owner", "abc", version)
 
