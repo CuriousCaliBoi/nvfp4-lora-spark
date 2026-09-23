@@ -12,6 +12,7 @@ import pytest
 
 from reef.artifact.artifact import Artifact, LiveWeightArtifactRef
 from reef.runtime.interfaces import ModelCandidate, TrainingRuntime, UpstreamStatusError
+from reef.runtime.scheduler import RuntimeScheduler
 from reef.train.backend import PreparedStep
 from reef.train.runtime_backend import RuntimeCandidateBackend
 from reef.surface.weights import WeightLoader
@@ -265,6 +266,64 @@ def test_native_load_failure_remains_fenced_through_actual_reef_abort(rig):
     assert state["fenced"]
     rig.actor.fail_load = False
     rig.runtime.activate_checkpoint(rig.artifact)
+    rig.runtime.mark_published()
+    rig.runtime.resume_admission()
+    assert rig.runtime.inference_admission_status["open"]
+
+
+def test_same_runtime_initial_head_reload_reopens_after_evaluation_abort(rig):
+    training = RejectOnlyTrainingRuntime()
+    backend = RuntimeCandidateBackend(training, "test", inference_runtime=rig.runtime)
+    backend.abort_step(PreparedStep.with_candidate(rig.candidate, state={}, metrics={}))
+    reconciled = []
+
+    def reconcile(artifact):
+        assert not rig.runtime.inference_admission_status["open"]
+        reconciled.append(artifact.ref.release_id)
+
+    rig.runtime._on_checkpoint_activation = reconcile
+    original = rig.runtime.current_runtime_load_id()
+    loader = WeightLoader()
+    assert loader.recover(rig.artifact.ref, rig.artifact.ref, rig.runtime) == rig.artifact.ref
+    loader.activate(rig.artifact, rig.runtime)
+    rebuilt = RuntimeScheduler(training, rig.runtime)
+    rebuilt.recover_pending_step(0, committed_training_job_id=None)
+    assert reconciled == [rig.artifact.ref.release_id]
+    assert rig.runtime.current_runtime_load_id() == original
+    assert rig.runtime.inference_admission_status["open"]
+    result = asyncio.run(rig.runtime.inference_handler.inference(rig.artifact, "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "A new request after recovery"}],
+    }))
+    assert result["training"]["runtime_load_id"] == original
+
+
+@pytest.mark.parametrize("failure", ["native", "callback"])
+def test_same_runtime_head_reload_failure_remains_closed(rig, failure):
+    if failure == "native":
+        binding, _ = rig.runtime.snapshot(rig.artifact)
+        rig.actor.registry[binding.name]["root"] = "/wrong"
+    else:
+        def fail(artifact):
+            raise ValueError("training reconciliation failed")
+        rig.runtime._on_checkpoint_activation = fail
+    with pytest.raises(ValueError):
+        WeightLoader().activate(rig.artifact, rig.runtime)
+    scheduler = RuntimeScheduler(RejectOnlyTrainingRuntime(), rig.runtime)
+    scheduler.recover_pending_step(0, committed_training_job_id=None)
+    rig.runtime.resume_admission()
+    assert not rig.runtime.inference_admission_status["open"]
+    assert json.loads((rig.state / "serving-state.json").read_text())["fenced"]
+
+
+def test_explicit_rollback_of_same_checkpoint_waits_for_commit(rig):
+    calls = []
+    rig.runtime._on_checkpoint_activation = calls.append
+    loader = WeightLoader()
+    loader.load(rig.artifact, rig.runtime)
+    republished = Artifact.local(rig.base)
+    loader.activate(republished, rig.runtime)
+    assert calls == [republished]
+    assert not rig.runtime.inference_admission_status["open"]
     rig.runtime.mark_published()
     rig.runtime.resume_admission()
     assert rig.runtime.inference_admission_status["open"]

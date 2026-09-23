@@ -438,8 +438,13 @@ class VllmInferenceRuntime(InferenceRuntime):
                 binding = self._ensure_verified(path)
                 initial = self._active_release is None
                 pending_candidate = self._pending is not None and binding.checkpoint_id == self._pending["candidate_id"]
+                published = self._loads.get(self.current_runtime_load_id())
+                recovering_head = (
+                    not pending_candidate and self._restoring_checkpoint_id is None
+                    and (initial or published is not None and published.checkpoint_id == binding.checkpoint_id)
+                )
                 reconcile = not pending_candidate and (
-                    initial or self._fenced or self._restoring_checkpoint_id is not None or self._pending is not None
+                    recovering_head or self._fenced or self._restoring_checkpoint_id is not None or self._pending is not None
                 )
                 if self._restoring_checkpoint_id is not None and binding.checkpoint_id != self._restoring_checkpoint_id:
                     raise ValueError("rollback activation differs from its verified restore target")
@@ -460,7 +465,7 @@ class VllmInferenceRuntime(InferenceRuntime):
                 self._fenced = False
                 self._restoring_checkpoint_id = None
                 self._persist()
-                if initial and self._pending is None:
+                if recovering_head:
                     self.mark_published()
                     self.resume_admission()
                 return version
