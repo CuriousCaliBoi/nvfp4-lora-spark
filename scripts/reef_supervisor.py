@@ -15,6 +15,7 @@ import time
 from urllib.request import Request, urlopen
 
 from run_reef_gsm8k import MODEL, read_json, sha256, write_json
+from build_reef_marlin_image import validate_build_report, verify_actor_patch
 
 
 REEF_REVISION = "b637cbe42393e91e8ee75af2179f844da586c3dd"
@@ -309,6 +310,8 @@ class Supervisor:
         if source_status:
             raise ValueError("tracked experiment source must be committed before launch")
         image_id = command(["docker", "image", "inspect", "--format", "{{.Id}}", args.image])
+        image_build = validate_build_report(read_json(args.image_provenance), image_id, args.repo)
+        write_json(args.output / "image-build.json", image_build)
         original = docker_inspect(args.server)
         self.server_id, self.was_running = original["Id"], original["State"]["Running"]
         if self.was_running:
@@ -330,6 +333,7 @@ class Supervisor:
                    "original_server_id": self.server_id, "original_image_id": original["Image"],
                    "original_running": self.was_running, "max_runtime": args.max_runtime,
                    "actor_command": actor, "worker_command": worker,
+                   "image_provenance_sha256": sha256(args.image_provenance),
                    "campaign_sha256": sha256(args.plan), "probe_sha256": sha256(args.probe_token_ids)})
         self.check_worker_permissions(worker, image_id)
         if self.was_running:
@@ -344,7 +348,10 @@ class Supervisor:
         command(["docker", "start", actor_id])
         self.wait_health(f"http://127.0.0.1:{args.actor_port}/health", args.startup_timeout, container_id=actor_id)
         version = get_json(f"http://127.0.0.1:{args.actor_port}/version")["version"]
-        attestation = actor_attestation(docker_inspect(actor_id), self.owner, args.model_revision, version)
+        inspected_actor = docker_inspect(actor_id)
+        patch_evidence = verify_actor_patch(inspected_actor, self.owner, image_build, args.repo, run=command)
+        attestation = actor_attestation(inspected_actor, self.owner, args.model_revision, version)
+        attestation.update(patch_evidence)
         write_json(args.output / "learning/serving/actor-contract.json", attestation)
         self.start_reef("first")
         self.campaign("create", ["--output", args.output / "scenario-created.json"])
@@ -448,7 +455,7 @@ class Supervisor:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("image", "repo", "reef-repo", "reef-python", "hf-cache", "model-dir", "model-revision",
+    for name in ("image", "image-provenance", "repo", "reef-repo", "reef-python", "hf-cache", "model-dir", "model-revision",
                  "output", "plan", "probe-token-ids", "server", "health-url"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--scenario", default="nvfp4-gsm8k")
@@ -461,7 +468,7 @@ def parse_args(argv=None):
     parser.add_argument("--proxy-url")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    for name in ("repo", "reef_repo", "reef_python", "hf_cache", "output", "plan", "probe_token_ids"):
+    for name in ("repo", "reef_repo", "reef_python", "hf_cache", "output", "plan", "probe_token_ids", "image_provenance"):
         setattr(args, name, require_path(getattr(args, name), name))
     if args.reef_port in {8900, 8901, 30000} or args.actor_port in {8900, 8901, 30000} or args.reef_port == args.actor_port:
         parser.error("owned ports must not collide with preserved services")
@@ -481,6 +488,7 @@ def main():
     if args.dry_run:
         owner = "reef-nvfp4-dry-run"
         print(json.dumps({"actor_command": actor_argv(args, args.image, owner),
+                          "image_provenance": str(args.image_provenance),
                           "worker_command": worker_argv(args, args.image, owner, "HOST_REVISION"),
                           "config": build_config(args, worker_launcher(args), owner)}, indent=2))
         return 0

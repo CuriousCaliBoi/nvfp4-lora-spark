@@ -2,7 +2,7 @@
 
 This integration connects the existing REEF installation to the frozen Nemotron NVFP4 checkpoint and attention LoRA. CPU REEF records inference receipts, accepts strict GSM8K feedback, schedules candidate training, evaluates it, commits accepted artifacts and publishes verified native vLLM adapters. Each GPU job restores the committed adapter, AdamW state and RNG state. A short campaign is a technical continuity check; it does not establish improved accuracy.
 
-The reviewed environment is REEF `b637cbe42393e91e8ee75af2179f844da586c3dd`, reef-client 0.2.0, vLLM 0.27.1, and model revision `bee7596271d1495f6992ae224aefde4410e816b8`. The container image must already exist locally. The supervisor resolves its immutable image ID and requires committed tracked source.
+The reviewed environment is REEF `b637cbe42393e91e8ee75af2179f844da586c3dd`, reef-client 0.2.0, vLLM 0.27.1, and model revision `bee7596271d1495f6992ae224aefde4410e816b8`. The supervisor requires the separately built research image and its verified build report, resolves its immutable image ID, and requires committed tracked source.
 
 The experiment source checkout on the Spark is `/home/nimitz/projects/reef-nvfp4-integration`; the separate `/home/nimitz/projects/REEF` checkout provides the CPU service and its virtual environment. Run the commands below from the experiment checkout. Direct client/data commands need that checkout on `PYTHONPATH`; the supervisor supplies it to its child processes.
 
@@ -58,6 +58,23 @@ This predeclares six batches, four train questions each, and sixteen held-out te
 
 Prepare a JSON list of native token IDs for numerical verification, using this exact checkpoint's tokenizer or a retained native inference record. Use an identical fixed sequence of 2–1023 tokens for all probes. Do not retokenize training receipts. Supply that file with `--probe-token-ids`; preserve it with the input evidence.
 
+## Build the isolated research image
+
+The research image adds only the Python helper and call site from [upstream Marlin token-order PR 52532](https://github.com/vllm-project/vllm/pull/52532), pinned to commit `e8a07dcccf8e48dd4b9b42a355fc6d5b9db59073`. It orders routed tokens within complete contiguous expert regions, preserving expert assignment, padding and the single-token fast path. This is an unmerged diagnostic hypothesis; the existing native probability gates still determine whether this actor can enter the campaign.
+
+Build from the committed experiment checkout with the pinned base image already present locally:
+
+```bash
+python3 scripts/build_reef_marlin_image.py \
+  --repo /home/nimitz/projects/reef-nvfp4-integration \
+  --tag reef-marlin-order:research-01 \
+  --output /absolute/fresh/marlin-build.json
+```
+
+This command uses no GPU, downloads no packages, and performs no vLLM or CUDA rebuild. The Dockerfile derives from exact base image ID `sha256:2b57e729b712509ed2eafbb49ca51d754a0f703e08b0b8b02bda8ab44f0a7925` through a fresh temporary local alias checked before and after building. Build steps use `--network=none` and `--pull=false`. Existing output tags are refused; the original base and production container remain unchanged. Only the temporary alias is removed afterward.
+
+The installer rejects unexpected original bytes and duplicate application. The build report records the source revision, all copied input hashes, base/derived image IDs, upstream commit, original/patched source hashes, helper/patch hashes and installed manifest hash. The isolated context includes upstream attribution and its Apache license. A CPU-only verification container independently reads the installed source, manifest and installer and checks the vLLM package version. Keep the build JSON with the immutable image; do not reconstruct it from labels.
+
 ## Inspect and launch
 
 Run on the GPU host. `--dry-run` prints the planned actor command, worker command and learning configuration without stopping or starting services. Replace the image and paths with their actual local values; the state output must be fresh. The existing proxy is optional and remains outside supervisor ownership.
@@ -66,7 +83,8 @@ Run on the GPU host. `--dry-run` prints the planned actor command, worker comman
 cd /home/nimitz/projects/reef-nvfp4-integration
 REEF_PROXY_TOKEN_FILE=/home/nimitz/projects/nvfp4-experiments/reef-proxy-20260922-01/.token \
   scripts/run_spark_reef_cycle.sh \
-  --image spark-vllm-tinylora:0.1 \
+  --image reef-marlin-order:research-01 \
+  --image-provenance /absolute/fresh/marlin-build.json \
   --repo /home/nimitz/projects/reef-nvfp4-integration \
   --reef-repo /home/nimitz/projects/REEF \
   --reef-python /home/nimitz/projects/REEF/.venv/bin/python3 \
@@ -83,6 +101,8 @@ REEF_PROXY_TOKEN_FILE=/home/nimitz/projects/nvfp4-experiments/reef-proxy-2026092
 ```
 
 After reviewing the commands, omit `--dry-run` to execute. Native execution is appropriate only after the combined CPU tests and code review pass. The supervisor checks ports, exact REEF source, committed experiment source, production health and host-readable worker output before changing GPU ownership. It stops only the recorded production container, refuses other GPU owners, and restores the same container on success or failure.
+
+Before changing GPU ownership, the supervisor requires the resolved image ID and current patch build inputs to match `--image-provenance`. After its owned actor starts, it independently reads and hashes the installed source, installer and manifest inside that container before starting CPU REEF. The resulting `actor-contract.json` binds the actual image ID, pinned base ID and checked patch evidence. An image label or successful API health response cannot satisfy this check. A mismatch stops admission and runs the same restoration path.
 
 The owned actor uses 23% GPU allocation, eager execution, context 1024, no speculative draft, no prefix caching, rank8 LoRA and processed log probabilities. `--generation-config vllm` prevents hidden checkpoint sampling defaults. Runtime adapter updates are enabled only on the owned loopback actor. Its attestation is built from the inspected Docker command and actual vLLM version endpoint. Native numerical tests still have to prove that the loaded adapter changes probabilities and that an independent alias reload reproduces them.
 

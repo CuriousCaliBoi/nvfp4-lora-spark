@@ -23,12 +23,13 @@ def settings(tmp_path):
     campaign.write_json(data / "holdout.json", {"rows": []})
     campaign.write_json(data / "campaign.json", {"holdout_sha256": campaign.sha256(data / "holdout.json")})
     campaign.write_json(data / "probe.json", [1, 2, 3])
+    campaign.write_json(data / "image-build.json", {"fake_build": True})
     return SimpleNamespace(output=tmp_path / "run", repo=ROOT, reef_repo=tmp_path / "reef",
         reef_python=Path(sys.executable), hf_cache=tmp_path / "hf", model_dir="/hf/snapshots/abc",
         model_revision="abc", image="local-image", server="production", health_url="http://127.0.0.1:30000/health",
         reef_port=8902, actor_port=30001, max_runtime=300, startup_timeout=60, job_timeout=120,
         health_timeout=60, scenario="nvfp4-gsm8k", plan=data / "campaign.json", probe_token_ids=data / "probe.json",
-        proxy_url=None)
+        proxy_url=None, image_provenance=data / "image-build.json")
 
 
 def inspected_actor(args, owner):
@@ -191,6 +192,8 @@ def test_supervisor_restores_exact_original_on_all_outcomes(settings, monkeypatc
     monkeypatch.setattr(ops, "free_port", lambda _: None)
     monkeypatch.setattr(ops.time, "sleep", lambda _: None)
     monkeypatch.setattr(ops, "get_json", lambda url, token=None: {"version": "0.27.1"} if url.endswith("/version") else {"ok": True})
+    monkeypatch.setattr(ops, "validate_build_report", lambda report, *args: report)
+    monkeypatch.setattr(ops, "verify_actor_patch", lambda *args, **kwargs: {"marlin_installed_source_sha256": "verified"})
     monkeypatch.setattr(ops.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="", stderr="", returncode=0))
     monkeypatch.setattr(supervisor, "start_reef", lambda suffix: None)
     monkeypatch.setattr(supervisor, "check_worker_permissions", lambda *args: None)
