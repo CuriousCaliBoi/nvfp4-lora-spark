@@ -41,6 +41,8 @@ def inspected_actor(args, owner):
 
 def test_actor_attestation_uses_inspected_command(settings):
     item = inspected_actor(settings, "owner")
+    assert "--no-enable-log-requests" in item["Args"]
+    assert "--disable-log-requests" not in item["Args"]
     result = ops.actor_attestation(item, "owner", "abc", "0.27.1")
     assert result["command"] == [item["Path"], *item["Args"]]
     assert result["container_id"] == "actor-id"
@@ -209,6 +211,30 @@ def test_command_calls_have_bounded_timeout(monkeypatch):
         return SimpleNamespace(stdout="ok")
     monkeypatch.setattr(ops.subprocess, "run", run)
     assert ops.command(["docker", "inspect", "owned"]) == "ok"
+
+
+def test_actor_health_wait_fails_immediately_when_owned_container_exits(settings, monkeypatch):
+    supervisor = ops.Supervisor(settings)
+    settings.output.mkdir()
+    actor = inspected_actor(settings, supervisor.owner)
+    actor["State"] = {"Running": False, "ExitCode": 2, "Status": "exited"}
+    monkeypatch.setattr(ops, "docker_inspect", lambda identifier: actor)
+    monkeypatch.setattr(ops, "get_json", lambda *a, **kw: pytest.fail("exited actor must not reach a health request"))
+    monkeypatch.setattr(ops.time, "sleep", lambda _: pytest.fail("exited actor must not wait through startup timeout"))
+    with pytest.raises(RuntimeError, match="owned actor exited"):
+        supervisor.wait_health("http://127.0.0.1:30001/health", 900, container_id="actor-id")
+    evidence = campaign.read_json(settings.output / "actor-startup-failure.json")
+    assert evidence["container_id"] == "actor-id"
+    assert evidence["state"]["ExitCode"] == 2
+
+
+def test_actor_health_wait_rejects_changed_ownership(settings, monkeypatch):
+    supervisor = ops.Supervisor(settings)
+    actor = inspected_actor(settings, "someone-else")
+    monkeypatch.setattr(ops, "docker_inspect", lambda identifier: actor)
+    monkeypatch.setattr(ops, "get_json", lambda *a, **kw: pytest.fail("unowned actor must not be accepted"))
+    with pytest.raises(RuntimeError, match="ownership changed"):
+        supervisor.wait_health("http://127.0.0.1:30001/health", 900, container_id="actor-id")
 
 
 def test_worker_permissions_checked_without_gpu_before_training(settings, monkeypatch):

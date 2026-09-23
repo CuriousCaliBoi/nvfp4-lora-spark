@@ -67,7 +67,7 @@ def actor_argv(args, image_id, owner):
             "--moe-backend", "marlin", "--mamba-backend", "flashinfer", "--mamba-cache-mode", "align",
             "--kv-cache-dtype", "fp8", "--enable-lora", "--max-lora-rank", "8",
             "--max-loras", "2", "--max-cpu-loras", "16", "--no-enable-prefix-caching",
-            "--logprobs-mode", "processed_logprobs", "--generation-config", "vllm", "--disable-log-requests"]
+            "--logprobs-mode", "processed_logprobs", "--generation-config", "vllm", "--no-enable-log-requests"]
 
 
 def worker_argv(args, image_id, owner, source_revision):
@@ -166,11 +166,20 @@ class Supervisor:
             raise TimeoutError("campaign runtime budget expired")
         return remaining
 
-    def wait_health(self, url, timeout, *, process=None):
+    def wait_health(self, url, timeout, *, process=None, container_id=None):
         until = min(self.deadline, time.monotonic() + timeout)
         while time.monotonic() < until:
             if process is not None and process.poll() is not None:
                 raise RuntimeError("owned service exited before becoming healthy; inspect its log")
+            if container_id is not None:
+                actor = docker_inspect(container_id)
+                if actor["Config"].get("Labels", {}).get("nvfp4-reef.owner") != self.owner:
+                    raise RuntimeError("actor ownership changed while waiting for startup")
+                if not actor["State"]["Running"]:
+                    write_json(self.args.output / "actor-startup-failure.json", {
+                        "container_id": actor["Id"], "image_id": actor["Image"], "state": actor["State"],
+                    })
+                    raise RuntimeError("owned actor exited before becoming healthy; inspect its retained log")
             try:
                 return get_json(url)
             except (OSError, ValueError):
@@ -312,7 +321,7 @@ class Supervisor:
         actor_id = command(actor)
         write_json(args.output / "actor-created.json", {"container_id": actor_id, "owner": self.owner})
         command(["docker", "start", actor_id])
-        self.wait_health(f"http://127.0.0.1:{args.actor_port}/health", args.startup_timeout)
+        self.wait_health(f"http://127.0.0.1:{args.actor_port}/health", args.startup_timeout, container_id=actor_id)
         version = get_json(f"http://127.0.0.1:{args.actor_port}/version")["version"]
         attestation = actor_attestation(docker_inspect(actor_id), self.owner, args.model_revision, version)
         write_json(args.output / "learning/serving/actor-contract.json", attestation)
