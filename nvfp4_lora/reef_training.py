@@ -185,7 +185,7 @@ class QuantizedTrainingRuntime(TrainingRuntime):
                 raise ValueError("zero-signal batch cannot execute an optimizer update")
             status_path = self._jobs / f"{identity}.status.json"
             if status_path.exists() and self._read_status(identity)["status"] in ("rejected", "committed"):
-                raise ValueError("terminal training job cannot be retrained")
+                raise StaleCandidate({"terminal_candidate_replay": 1})
             self._status(identity, "prepared", parent_checkpoint_id=incumbent["checkpoint_id"])
             if destination.exists():
                 result = self._validated(destination)
@@ -213,7 +213,10 @@ class QuantizedTrainingRuntime(TrainingRuntime):
             status = self._read_status(identity)
             if status["status"] == "committed":
                 raise ValueError("cannot reject a committed training job")
-            self._status(identity, "rejected", parent_checkpoint_id=status["parent_checkpoint_id"])
+            if status["status"] == "rejected":
+                return
+            outcome = "aborted" if getattr(decision, "policy", None) == "reef_abort" else "rejected"
+            self._status(identity, outcome, parent_checkpoint_id=status["parent_checkpoint_id"])
 
     def commit_candidate(self, training_job_id):
         with self._lock:

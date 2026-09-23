@@ -14,7 +14,10 @@ from torch import nn
 
 pytest.importorskip("reef")
 from reef.core.records_types import AgentRecord, RequestType
-from reef.runtime.interfaces import InferenceRuntime, StaleCandidate
+from reef.core.evaluation import CandidateEvaluationPlugin, EvaluationResult, SelectionDecision
+from reef.runtime.interfaces import ActivatedModel, InferenceRuntime, StaleCandidate
+from reef.storage.sqlite import SQLiteRecordStore
+from reef.train import Trainer
 from reef.train.runtime_backend import RuntimeCandidateBackend
 from reef.train.types import ProcessorContext
 
@@ -228,6 +231,94 @@ def test_actual_candidate_backend_drops_stale_and_accepts_later_valid_work(runti
     assert valid.outcome == "candidate"
     assert int((runtime.state_root / "worker_calls").read_text()) == 2
     assert runtime.incumbent_checkpoint == runtime.base_checkpoint
+
+
+def test_actual_trainer_reload_reuses_candidate_after_evaluation_abort(runtime_factory):
+    class Receiver(InferenceRuntime):
+        version = "runtime:one"
+
+        @property
+        def inference_handler(self):
+            return None
+
+        def serving_runtime_load_id(self):
+            return self.version
+
+        def activate_candidate(self, candidate):
+            self.version = "runtime:two"
+            return ActivatedModel(candidate.candidate_id, self.version)
+
+    class TransientEvaluator(CandidateEvaluationPlugin):
+        def __init__(self):
+            self.seen = []
+
+        def evaluate(self, candidate):
+            self.seen.append(candidate.candidate_id)
+            if len(self.seen) == 1:
+                raise RuntimeError("transient evaluation failure")
+            return EvaluationResult("test", "1", {})
+
+        def decide(self, candidate, evaluation):
+            return SelectionDecision("select", "test", "1", "recovered evaluation", evaluation)
+
+    runtime = runtime_factory()
+    base = runtime.incumbent_checkpoint
+    receiver = Receiver(base_url="http://unused")
+    store = SQLiteRecordStore()
+    for pair in records(manifest=validate_checkpoint(base)):
+        for item in pair:
+            store.append(item)
+    evaluator = TransientEvaluator()
+
+    def create_trainer():
+        return Trainer.build("test", store,
+            processor_factory=lambda context: NVFP4Processor(context.with_config({"group_size": 2, "batch_group_count": 1})),
+            candidate_backend=RuntimeCandidateBackend(runtime, PREPARER, inference_runtime=receiver, scenario="test"),
+            candidate_evaluator=evaluator, report_type=NVFP4RolloutReport)
+
+    first = create_trainer()
+    reserved = first.reserve_training_batch()
+    with pytest.raises(RuntimeError, match="transient evaluation"):
+        first.execute_reserved_step(0)
+    identity = evaluator.seen[0]
+    status = runtime.state_root / "jobs" / f"{identity}.status.json"
+    assert json.loads(status.read_text())["status"] == "aborted"
+    assert runtime.incumbent_checkpoint == base
+    assert int((runtime.state_root / "worker_calls").read_text()) == 2
+    first.close()
+    reloaded = create_trainer()
+    assert reloaded.reserve_training_batch().batch_id == reserved.batch_id
+    result = reloaded.execute_reserved_step(0)
+    assert result.outcome == "commit" and result.result.training_job_id == identity
+    assert evaluator.seen == [identity, identity]
+    assert json.loads(status.read_text())["status"] == "complete"
+    assert runtime.incumbent_checkpoint == base
+    assert int((runtime.state_root / "worker_calls").read_text()) == 2
+    reloaded.close()
+
+
+def test_normal_policy_rejection_replay_drops_without_worker(runtime_factory):
+    class Receiver(InferenceRuntime):
+        @property
+        def inference_handler(self):
+            return None
+
+        def serving_runtime_load_id(self):
+            return "runtime:one"
+
+    runtime = runtime_factory()
+    backend = RuntimeCandidateBackend(runtime, PREPARER, inference_runtime=Receiver(base_url="http://unused"), scenario="test")
+    actual = batch(validate_checkpoint(runtime.incumbent_checkpoint))
+    prepared_step = backend.prepare_step(actual, {}, 0)
+    evaluation = EvaluationResult("test", "1", {})
+    decision = SelectionDecision("reject", "strict_heldout_nonregression", "1", "candidate regression", evaluation)
+    backend.settle_step(prepared_step, decision)
+    backend.abort_step(prepared_step)
+    replay = backend.prepare_step(actual, {}, 0)
+    assert replay.outcome == "drop"
+    assert replay.metrics["terminal_candidate_replay"] == 1
+    assert runtime.incumbent_checkpoint == runtime.base_checkpoint
+    assert int((runtime.state_root / "worker_calls").read_text()) == 2
 
 
 def test_failed_rollback_reconciles_authoritative_head_before_learning(runtime_factory):
