@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import re
-from decimal import Decimal
 
 import torch
 from torch import Tensor
+from .reef_data import GSM8K_SYSTEM_PROMPT, gsm8k_reward
 
 
 @dataclass
@@ -125,24 +124,9 @@ def behavior_metrics(old: Tensor, behavior: Tensor, mask: Tensor, tis_min=0.1, t
     }
 
 
-_NUMBER = r"[-+]?(?:(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?|\.[0-9]+)"
-_FINAL = re.compile(r"^[ \t]*####[ \t]*(" + _NUMBER + r")\.?\s*\Z", re.MULTILINE)
-
-
-def _final_number(text: str) -> Decimal | None:
-    match = _FINAL.search(text)
-    return Decimal(match.group(1).replace(",", "")) if match else None
-
-
-def gsm8k_reward(completion: str, answer: str) -> float:
-    gold = _final_number(answer)
-    predicted = _final_number(completion)
-    return float(gold is not None and predicted == gold)
-
-
 def prompt_ids(tokenizer, question: str) -> list[int]:
     encoded = tokenizer.apply_chat_template([
-        {"role": "system", "content": "Solve with a concise calculation. End with a final line exactly in the form: #### <number>."},
+        {"role": "system", "content": GSM8K_SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ], tokenize=True, add_generation_prompt=True, enable_thinking=False)
     if hasattr(encoded, "keys"):
