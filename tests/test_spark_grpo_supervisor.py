@@ -82,6 +82,7 @@ class SparkSupervisorTest(unittest.TestCase):
         self.write_tool("nvidia-smi", 'import os\nprint("1234" if os.environ.get("FAKE_SCENARIO") == "busy_gpu" else "")\n')
         self.write_tool("curl", 'import os, sys\nprint("healthy")\nsys.exit(1 if os.environ.get("FAKE_SCENARIO") == "health_failure" else 0)\n')
         self.write_tool("sleep", "import time\ntime.sleep(0.02)\n")
+        self.write_tool("git", 'import sys\nsys.exit(128)\n')
 
     def write_tool(self, name, source):
         path = self.bin / name
@@ -119,9 +120,21 @@ class SparkSupervisorTest(unittest.TestCase):
         self.assertIn(f"{self.root / 'hf'}:/hf:ro", create)
         self.assertIn("--network=none", create)
         self.assertIn("NVFP4_EVAL_CACHE_GB=0", create)
+        self.assertIn("NVFP4_SOURCE_REVISION=", create)
+        self.assertEqual((self.output / "source-commit").read_text().strip(), "unavailable")
         self.assertEqual(create[-3:], ["--output-dir", "/experiment/results", "--offline"])
         self.assertIn("--model-dir /hf/snapshot", (self.output / "supervisor.txt").read_text())
         self.assertTrue((self.output / "original-server-state.json").exists())
+
+    def test_host_source_revision_is_forwarded_without_container_git(self):
+        revision = "1234567890abcdef" * 2 + "12345678"
+        self.write_tool("git", f'import sys\nif "rev-parse" in sys.argv: print("{revision}")\n')
+        result, state, calls = self.run_supervisor()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_restored(state)
+        create = next(call for call in calls if call[0] == "create")
+        self.assertIn(f"NVFP4_SOURCE_REVISION={revision}", create)
+        self.assertEqual((self.output / "source-commit").read_text().strip(), revision)
 
     def test_training_failure_restores_server_and_preserves_exit(self):
         result, state, _ = self.run_supervisor("training_failure")

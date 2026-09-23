@@ -126,7 +126,10 @@ lock_owned=true
 was_running=$(docker inspect --format '{{.State.Running}}' "$server_id")
 [[ $was_running = true || $was_running = false ]] || fail "Cannot determine locked server state"
 docker inspect --format '{{json .State}}' "$server_id" > "$output/original-server-state.json"
+source_revision=
 if command -v git >/dev/null && git -C "$repo" rev-parse --verify HEAD > "$output/source-commit" 2>/dev/null; then
+    source_revision=$(cat "$output/source-commit")
+    [[ $source_revision =~ ^[[:xdigit:]]{40}$ || $source_revision =~ ^[[:xdigit:]]{64}$ ]] || fail "Host Git returned an invalid source revision"
     git -C "$repo" status --porcelain > "$output/source-status"
 else
     printf 'unavailable\n' > "$output/source-commit"
@@ -151,6 +154,7 @@ docker create --name "$container_name" --cidfile "$output/container-id" \
     -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e HF_DATASETS_OFFLINE=1 \
     -e PYTHONUNBUFFERED=1 -e PYTHONDONTWRITEBYTECODE=1 \
     -e PYTHONPATH=/workspace \
+    -e "NVFP4_SOURCE_REVISION=$source_revision" \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e NVFP4_EVAL_CACHE_GB=0 -e NVFP4_TRAIN_CACHE_GB=0 \
     -e VLLM_CACHE_ROOT=/vllm-cache -e TRITON_CACHE_DIR=/vllm-cache/triton \

@@ -13,7 +13,9 @@ source commit, working tree status, runner arguments and original container
 state. It mounts source and Hugging Face cache read-only, disables network
 access, and writes results under a fresh output directory. The explicitly
 chosen vLLM cache is writable. The runner stages dataset processing files in
-the experiment output.
+the experiment output. Host Git provenance is passed through
+`NVFP4_SOURCE_REVISION`, so the training image does not need Git installed;
+an unavailable revision remains explicitly unknown.
 
 For example, set these absolute host paths and use your existing image and
 inference container:
