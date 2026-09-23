@@ -1,7 +1,10 @@
 import importlib.util
+import errno
 import json
+import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 from types import SimpleNamespace, ModuleType
@@ -14,6 +17,47 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run_reef_gsm8k as campaign
 import reef_supervisor as ops
 import reef_worker_launch as launcher
+
+
+@pytest.mark.skipif(os.name != "posix", reason="REEF supervision targets POSIX socket reuse semantics")
+def test_restart_port_probe_accepts_real_time_wait():
+    with socket.socket() as listener, socket.socket() as client:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.settimeout(2)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen(1)
+        client.settimeout(2)
+        client.connect(("127.0.0.1", port))
+        connection, _ = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            connection.shutdown(socket.SHUT_WR)
+            assert client.recv(1) == b""
+            client.shutdown(socket.SHUT_WR)
+            assert connection.recv(1) == b""
+    with socket.socket() as old_probe, pytest.raises(OSError) as failure:
+        old_probe.bind(("127.0.0.1", port))
+    assert failure.value.errno == errno.EADDRINUSE
+    ops.free_port(port)
+    with socket.socket() as restarted:
+        restarted.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        restarted.bind(("127.0.0.1", port))
+        restarted.listen(1)
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "0.0.0.0"])
+@pytest.mark.parametrize("reuse", [False, True])
+def test_port_probe_still_rejects_active_listener(address, reuse):
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, int(reuse))
+        listener.bind((address, 0))
+        port = listener.getsockname()[1]
+        listener.listen(1)
+        with pytest.raises(OSError) as failure:
+            ops.free_port(port)
+        assert failure.value.errno == errno.EADDRINUSE
+        assert listener.getsockname()[1] == port
 
 
 @pytest.fixture
