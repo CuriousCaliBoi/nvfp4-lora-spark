@@ -8,6 +8,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 import tempfile
 
 MANIFEST = "nvfp4-checkpoint.json"
@@ -15,6 +16,25 @@ PAYLOAD_FILES = frozenset({
     "adapter/adapter_model.safetensors", "adapter/adapter_config.json",
     "native_adapter.safetensors", "optimizer.pt", "rng.pt", "metrics.json",
 })
+
+# These fingerprints bind the audit to the reviewed Lightning checkpoint and
+# training configuration; another architecture or configuration needs review.
+_BOOTSTRAP_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+_BOOTSTRAP_REVISION = "bee7596271d1495f6992ae224aefde4410e816b8"
+_BOOTSTRAP_MODEL_CONFIG = "f1d98b530846087dc08b574a219713a94f945bf6583dc7230a19ebf1e8c50933"
+_BOOTSTRAP_FROZEN = "771893dc6b235fbb8e415089e0362ecf088aaf295bee62dcbfbe4fc4ff0cc9fb"
+_BOOTSTRAP_TRAINING_CONFIG = "0b6b342997cacba1d6d40268cf119b020e78f1f097f4b3b4cba1ee7778aa7021"
+_BOOTSTRAP_LAYERS = (5, 12, 19, 26, 33, 42)
+_BOOTSTRAP_PROJECTIONS = {"q_proj": (2688, 4096), "k_proj": (2688, 256),
+                          "v_proj": (2688, 256), "o_proj": (4096, 2688)}
+_BOOTSTRAP_PEFT_CONFIG = {
+    "base_model_name_or_path": _BOOTSTRAP_MODEL, "bias": "none", "fan_in_fan_out": False,
+    "inference_mode": True, "init_lora_weights": True, "lora_alpha": 16,
+    "lora_dropout": 0.0, "modules_to_save": None, "peft_type": "LORA", "r": 8,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "task_type": "CAUSAL_LM",
+    "use_dora": False, "use_rslora": False,
+}
+_MAX_AUDIT_JSON_BYTES = 1024 * 1024
 
 
 def canonical_json(value) -> bytes:
@@ -130,6 +150,147 @@ def validate_checkpoint(path, *, expected_base_model=None, expected_model_revisi
         if wanted is not None and value[key] != wanted:
             raise ValueError(f"incompatible checkpoint {key}")
     return value
+
+
+def _strict_json(data: bytes):
+    def unique_pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError(f"nonfinite JSON constant: {value}")
+
+    if len(data) > _MAX_AUDIT_JSON_BYTES:
+        raise ValueError("audit JSON exceeds size bound")
+    return json.loads(data, object_pairs_hook=unique_pairs, parse_constant=reject_constant)
+
+
+def _audit_safetensors(path: Path, expected_shapes: dict) -> tuple[dict, str]:
+    payload_size = sum(rows * columns * 2 for rows, columns in expected_shapes.values())
+    if not 8 < path.stat().st_size <= 8 + _MAX_AUDIT_JSON_BYTES + payload_size:
+        raise ValueError("invalid safetensors file size")
+    data = path.read_bytes()
+    header_size = struct.unpack_from("<Q", data)[0]
+    if not 0 < header_size <= min(_MAX_AUDIT_JSON_BYTES, len(data) - 8):
+        raise ValueError("invalid safetensors header length")
+    header_bytes = data[8:8 + header_size]
+    if not header_bytes.startswith(b"{"):
+        raise ValueError("invalid safetensors JSON header")
+    header = _strict_json(header_bytes)
+    if not isinstance(header, dict):
+        raise ValueError("invalid safetensors header object")
+    metadata = header.pop("__metadata__", {})
+    if not isinstance(metadata, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                             for k, v in metadata.items()):
+        raise ValueError("invalid safetensors metadata")
+    if set(header) != set(expected_shapes):
+        raise ValueError("safetensors tensor names differ from reviewed attention targets")
+    payload = memoryview(data)[8 + header_size:]
+    if len(payload) != payload_size:
+        raise ValueError("safetensors payload size differs from reviewed layout")
+    tensors, intervals = {}, []
+    for name, shape in expected_shapes.items():
+        entry = header[name]
+        if not isinstance(entry, dict) or set(entry) != {"dtype", "shape", "data_offsets"}:
+            raise ValueError(f"invalid safetensors descriptor: {name}")
+        if entry["dtype"] != "BF16":
+            raise ValueError(f"safetensors dtype must be BF16: {name}")
+        actual_shape = entry["shape"]
+        if (not isinstance(actual_shape, list) or any(type(x) is not int for x in actual_shape)
+                or actual_shape != list(shape)):
+            raise ValueError(f"safetensors shape differs from reviewed layout: {name}")
+        offsets = entry["data_offsets"]
+        if (not isinstance(offsets, list) or len(offsets) != 2
+                or any(type(x) is not int for x in offsets)):
+            raise ValueError(f"invalid safetensors offsets: {name}")
+        start, end = offsets
+        if not 0 <= start < end <= len(payload) or end - start != shape[0] * shape[1] * 2:
+            raise ValueError(f"safetensors offsets exceed bounds or tensor size: {name}")
+        intervals.append((start, end))
+        tensors[name] = payload[start:end]
+    cursor = 0
+    for start, end in sorted(intervals):
+        if start != cursor:
+            raise ValueError("safetensors payload has overlapping tensors or gaps")
+        cursor = end
+    if cursor != len(payload):
+        raise ValueError("safetensors payload has unclaimed bytes")
+    return tensors, hashlib.sha256(data).hexdigest()
+
+
+def audit_bootstrap_checkpoint(path) -> dict:
+    """Audit the reviewed zero-LoRA layout without Torch, NumPy, or pickle loads.
+
+    Model/config/frozen fingerprints are compared with the pinned reviewed
+    manifest values. This does not rehash the base model or deserialize Adam/RNG.
+    """
+    path = Path(path).resolve()
+    manifest = validate_checkpoint(path, expected_base_model=_BOOTSTRAP_MODEL,
+                                   expected_model_revision=_BOOTSTRAP_REVISION,
+                                   expected_lora_rank=8, expected_lora_alpha=16,
+                                   expected_config_sha256=_BOOTSTRAP_TRAINING_CONFIG)
+    manifest_bytes = _safe_file(path, MANIFEST).read_bytes()
+    if _strict_json(manifest_bytes) != manifest or type(manifest["schema_version"]) is not int:
+        raise ValueError("invalid bootstrap manifest")
+    if (manifest["optimizer_step"] != 0 or manifest["parent_checkpoint_id"] is not None
+            or manifest["training_job_id"] is not None or manifest["batch_sha256"] is not None):
+        raise ValueError("bootstrap audit requires an untrained checkpoint")
+    for key, expected in (("model_config_sha256", _BOOTSTRAP_MODEL_CONFIG),
+                          ("frozen_tensor_sha256", _BOOTSTRAP_FROZEN)):
+        if manifest[key] != expected:
+            raise ValueError(f"bootstrap {key} differs from reviewed fingerprint")
+    config_bytes = _safe_file(path, "adapter/adapter_config.json").read_bytes()
+    config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    if config_sha256 != manifest["files"]["adapter/adapter_config.json"]:
+        raise ValueError("adapter config changed during bootstrap audit")
+    if canonical_json(_strict_json(config_bytes)) != canonical_json(_BOOTSTRAP_PEFT_CONFIG):
+        raise ValueError("bootstrap PEFT configuration differs from reviewed configuration")
+    shapes = {}
+    targets = []
+    for layer in _BOOTSTRAP_LAYERS:
+        for projection, (inputs, outputs) in _BOOTSTRAP_PROJECTIONS.items():
+            target = f"model.layers.{layer}.mixer.{projection}"
+            targets.append(target)
+            shapes[f"{target}.lora_A"] = (8, inputs)
+            shapes[f"{target}.lora_B"] = (outputs, 8)
+    export_names = {name: "base_model.model.backbone." + name.removeprefix("model.") + ".weight"
+                    for name in shapes}
+    native, native_sha256 = _audit_safetensors(_safe_file(path, "native_adapter.safetensors"), shapes)
+    peft, peft_sha256 = _audit_safetensors(_safe_file(path, "adapter/adapter_model.safetensors"),
+                                        {export_names[name]: shape for name, shape in shapes.items()})
+    for name, checksum in (("native_adapter.safetensors", native_sha256),
+                           ("adapter/adapter_model.safetensors", peft_sha256)):
+        if checksum != manifest["files"][name]:
+            raise ValueError(f"adapter changed during bootstrap audit: {name}")
+    tensor_evidence = []
+    for name, tensor in native.items():
+        if name.endswith(".lora_B"):
+            if any(tensor):
+                raise ValueError(f"bootstrap B tensor is not byte-positive-zero: {name}")
+        elif any(bits & 0x7f80 == 0x7f80 for (bits,) in struct.iter_unpack("<H", tensor)):
+            raise ValueError(f"bootstrap A tensor contains nonfinite BF16 values: {name}")
+        if tensor != peft[export_names[name]]:
+            raise ValueError(f"native and PEFT tensor bytes differ: {name}")
+        tensor_evidence.append({"native_name": name, "peft_name": export_names[name],
+                                "shape": list(shapes[name]), "dtype": "BF16",
+                                "sha256": hashlib.sha256(tensor).hexdigest()})
+    return {"audit_schema_version": 1, "checkpoint_id": manifest["checkpoint_id"],
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "base_model": manifest["base_model"], "model_revision": manifest["model_revision"],
+            "model_config_sha256": manifest["model_config_sha256"],
+            "frozen_tensor_sha256": manifest["frozen_tensor_sha256"],
+            "fingerprint_scope": "pinned_manifest_values", "config_sha256": manifest["config_sha256"],
+            "adapter_config_sha256": config_sha256, "adapter_sha256": peft_sha256,
+            "native_adapter_sha256": native_sha256, "lora_rank": 8, "lora_alpha": 16,
+            "optimizer_step": 0, "parent_checkpoint_id": None, "attention_targets": targets,
+            "target_count": len(targets), "tensor_count": len(shapes),
+            "parameter_count": sum(rows * columns for rows, columns in shapes.values()),
+            "positive_zero_b_count": len(targets), "finite_a_count": len(targets),
+            "native_peft_exact_match": True, "tensor_mapping_sha256": content_hash(tensor_evidence)}
 
 
 def publish_checkpoint(staging, destination, manifest: dict) -> Path:
