@@ -7,10 +7,12 @@ it never loads the original BF16 base. This is adapter-only RL, not native FP4
 pretraining or the 13-parameter TinyLoRA parametrization.
 
 The first supported configuration is NVIDIA Nemotron 3.5 Lightning 30B-A3B on
-one DGX Spark, with Transformers 5.15, vLLM 0.27.1, and PyTorch 2.13. These are
-the integration targets; a test result must establish runtime compatibility.
-The runner uses Marlin MoE, FlashInfer Mamba, aligned Mamba cache, FP8 KV cache,
-eager execution, and vLLM's single-process external launcher. It requires
+one DGX Spark, with Transformers 5.15, vLLM 0.27.1, and PyTorch 2.13. See the
+[measured smoke experiment](GRPO_SMOKE.md) for runtime validation and results.
+The runner uses Marlin MoE, FlashInfer Mamba, FP8 KV cache, eager execution,
+and vLLM's single-process external launcher. It requests aligned Mamba cache;
+with prefix caching disabled in the measured run, vLLM overrides the effective
+Mamba cache mode to `none`. It requires
 `datasets`, `huggingface_hub`, `safetensors`, and `psutil` in addition to the
 model/runtime dependencies. All model and dataset files can be cached in
 advance; `--offline` forbids Hub downloads.
