@@ -61,6 +61,7 @@ lands at 49.7-54.5 EM across 4 runs vs base 36.9, overlapping this repo's runtim
 - [Install](#install)
 - [60 seconds, no model download: does my adapter actually bind?](#60-seconds-no-model-download-does-my-adapter-actually-bind)
 - [The loop](#the-loop)
+- [Local GRPO with Nemotron NVFP4](#local-grpo-with-nemotron-nvfp4)
 - [On-ramp: reproduce a real before/after in ~30 minutes (public 8B)](#on-ramp-reproduce-a-real-beforeafter-in-30-minutes-public-8b)
 - [A note on serving speed](#a-note-on-serving-speed)
 - [How it works](#how-it-works) — [Why NVFP4](#why-nvfp4-not-plain-fp4) · [The unified trainer](#the-unified-trainer)
@@ -135,6 +136,14 @@ wrong-base adapter via the manifest fingerprint; auto-re-keys a silent-no-op ada
 selects `--moe-backend emulation` when the adapter binds routed-expert deltas). `--verify`
 then runs the **decisive apply-check** — a prompt-echo logprob delta, base vs adapter:
 identical logprobs *prove* the adapter is a no-op; a moved delta proves it applies.
+
+## Local GRPO with Nemotron NVFP4
+
+The experimental local GRPO route trains attention LoRA adapters against a frozen
+Nemotron NVFP4 checkpoint, using vLLM rollouts from the same checkpoint. See
+[the GRPO runner and learning contract](docs/GRPO.md) and
+[the DGX Spark experiment instructions](docs/SPARK_GRPO.md). The implementation
+and CPU checks are available; the full DGX Spark experiment outcome is pending.
 
 ## On-ramp: reproduce a real before/after in ~30 minutes (public 8B)
 
