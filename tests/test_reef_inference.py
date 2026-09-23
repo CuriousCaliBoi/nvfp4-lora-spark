@@ -49,9 +49,9 @@ def actor_contract(directory):
         "schema_version": 1, "actor_instance_id": "actor-owned-one", "container_id": "container-one",
         "base_model": "test-model", "model_revision": "revision", "vllm_version": "0.27.1",
         "logprobs_mode": "processed_logprobs", "generation_config": "vllm",
-        "speculative_decoding": False, "exclusive_adapter_control": True,
+        "speculative_decoding": False, "exclusive_adapter_control": True, "async_scheduling": False,
         "command": ["vllm", "serve", "/hf", "--enable-lora", "--logprobs-mode", "processed_logprobs",
-                    "--generation-config", "vllm", "--max-cpu-loras", "16"],
+                    "--generation-config", "vllm", "--max-cpu-loras", "16", "--no-async-scheduling"],
     })
 
 
@@ -261,6 +261,79 @@ def test_native_response_is_preserved_before_alignment_validation(rig):
     raw = json.loads(Path(evidence["raw_probe_paths"]["reference_logprobs"]).read_text())
     assert raw["request"]["prompt"] == [1, 2, 3]
     assert raw["response"]["choices"][0]["prompt_token_ids"] == [99]
+
+
+def offset_probe(rig, offsets):
+    sequence = iter(offsets)
+
+    def mutate(result):
+        delta = next(sequence)
+        for row in result["choices"][0]["prompt_logprobs"][1:]:
+            for entry in row.values():
+                entry["logprob"] += delta
+
+    rig.actor.probe_mutation = mutate
+
+
+@pytest.mark.parametrize("probe_index,metric", [
+    (1, "reference_repeat_max_delta"), (3, "adapter_repeat_max_delta"),
+    (5, "reload_repeat_max_delta"), (6, "reference_after_load_max_delta"),
+    (7, "reference_after_load_repeat_max_delta"), (8, "adapter_after_reference_max_delta"),
+])
+def test_matching_reload_pair_cannot_hide_native_instability(rig, probe_index, metric):
+    offsets = [0.0] * 9
+    offsets[probe_index] = .001
+    offset_probe(rig, offsets)
+    with pytest.raises(ValueError, match=metric):
+        rig.runtime.verification(rig.candidate_path)
+    path, = (rig.state / "native-probes" / rig.candidate_path.name).glob("*/evidence.json")
+    evidence = json.loads(path.read_text())
+    assert evidence["status"] == "failed" and not evidence["native_verified"]
+    assert evidence["reload_max_delta"] == 0
+    assert evidence["adapter_effect_max_delta"] > evidence["reference_repeat_max_delta"]
+    assert evidence["observed_null_max_delta"] == pytest.approx(.001)
+    assert len(evidence["completed_probes"]) == 9
+    assert all(Path(value).is_file() for value in evidence["raw_probe_paths"].values())
+    assert not rig.runtime.inference_admission_status["open"]
+
+
+def test_matching_zero_adapter_aliases_cannot_hide_unstable_bare_base(rig):
+    offset_probe(rig, [0, .001, 0, 0, 0, 0, 0, 0, 0])
+    with pytest.raises(ValueError, match="reference_repeat_max_delta"):
+        VllmInferenceRuntime(**rig.options)
+    attempts = [json.loads(path.read_text()) for path in
+                (rig.state / "native-probes" / rig.base.name).glob("*/evidence.json")]
+    evidence, = [value for value in attempts if value["status"] == "failed"]
+    assert evidence["reference_name"] == "test-model"
+    assert evidence["adapter_effect_max_delta"] == evidence["reload_max_delta"] == 0
+    assert len(evidence["completed_probes"]) == 9
+
+
+def test_candidate_effect_must_exceed_alias_noise_even_below_stability_tolerance(rig):
+    offset_probe(rig, [0, 0, -.01 + .000004, -.01 + .000004,
+                       -.01 + .000009, -.01 + .000009, 0, 0, -.01 + .000004])
+    with pytest.raises(ValueError, match="above observed null/repeat/alias noise"):
+        rig.runtime.verification(rig.candidate_path)
+    path, = (rig.state / "native-probes" / rig.candidate_path.name).glob("*/evidence.json")
+    evidence = json.loads(path.read_text())
+    assert evidence["reference_repeat_max_delta"] == 0
+    assert evidence["adapter_effect_max_delta"] == pytest.approx(.000004)
+    assert evidence["observed_null_max_delta"] == pytest.approx(.000005)
+    assert evidence["observed_null_max_delta"] < 1e-5
+
+
+@pytest.mark.parametrize("offsets,metric", [
+    ([0, .000009, 0, 0, 0, 0, -.000009, -.000009, 0], "reference_observed_max_delta"),
+    ([0, 0, 0, .000009, -.000009, -.000009, 0, 0, 0], "adapter_observed_max_delta"),
+])
+def test_stability_bounds_every_observed_pair_with_identical_weights(rig, offsets, metric):
+    offset_probe(rig, offsets)
+    with pytest.raises(ValueError, match=metric):
+        rig.runtime.verification(rig.candidate_path)
+    path, = (rig.state / "native-probes" / rig.candidate_path.name).glob("*/evidence.json")
+    evidence = json.loads(path.read_text())
+    assert evidence[metric] == pytest.approx(.000018)
+    assert evidence["observed_null_max_delta"] == pytest.approx(.000018)
 
 
 def test_candidate_requires_matching_durable_acknowledgement(rig):
@@ -509,6 +582,25 @@ def test_incompatible_sampling_attestation_fails_before_native_load(rig):
     write_json(path, value)
     before = len(rig.actor.calls)
     with pytest.raises(ValueError, match="attestation"):
+        VllmInferenceRuntime(**rig.options)
+    assert len(rig.actor.calls) == before
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.pop("async_scheduling"),
+    lambda value: value.update(async_scheduling=True),
+    lambda value: value.update(async_scheduling=0),
+    lambda value: value["command"].remove("--no-async-scheduling"),
+    lambda value: value["command"].append("--async-scheduling"),
+    lambda value: value["command"].append("--async-scheduling=true"),
+])
+def test_async_scheduling_attestation_requires_false_and_unambiguous_inspected_flag(rig, mutation):
+    path = rig.state / "actor-contract.json"
+    value = json.loads(path.read_text())
+    mutation(value)
+    write_json(path, value)
+    before = len(rig.actor.calls)
+    with pytest.raises(ValueError, match="attestation|inspected actor command"):
         VllmInferenceRuntime(**rig.options)
     assert len(rig.actor.calls) == before
 

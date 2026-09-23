@@ -9,6 +9,7 @@ import math
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -200,7 +201,8 @@ class VllmInferenceRuntime(InferenceRuntime):
             "generation_config": "vllm", "speculative_decoding": False,
             "exclusive_adapter_control": True,
         }
-        if any(contract.get(key) != value for key, value in expected.items()):
+        if (any(contract.get(key) != value for key, value in expected.items())
+                or contract.get("async_scheduling") is not False):
             raise ValueError("actor startup attestation does not match the controlled learning actor")
         command = contract.get("command")
         if not isinstance(command, list) or not command or any(not isinstance(arg, str) for arg in command):
@@ -211,6 +213,8 @@ class VllmInferenceRuntime(InferenceRuntime):
             _option(command, "--logprobs-mode") != "processed_logprobs"
             or _option(command, "--generation-config") != "vllm"
             or "--enable-lora" not in command
+            or "--no-async-scheduling" not in command
+            or any(arg.split("=", 1)[0] == "--async-scheduling" for arg in command)
             or _option(command, "--speculative-config") is not None
             or int(_option(command, "--max-cpu-loras") or "0") < self._capacity
         ):
@@ -368,18 +372,31 @@ class VllmInferenceRuntime(InferenceRuntime):
                 reference_after_load_max_delta=_maximum_delta(first, reference_after),
                 reference_after_load_repeat_max_delta=_maximum_delta(reference_after, reference_after_repeat),
                 adapter_after_reference_max_delta=_maximum_delta(scores, adapter_after),
+                reference_observed_max_delta=max(_maximum_delta(a, b) for a, b in combinations(
+                    (first, repeated, reference_after, reference_after_repeat), 2)),
+                adapter_observed_max_delta=max(_maximum_delta(a, b) for a, b in combinations(
+                    (scores, adapter_repeat, reloaded, reload_repeat, adapter_after), 2)),
             )
+            stability_metrics = (
+                "reference_repeat_max_delta", "adapter_repeat_max_delta", "reload_repeat_max_delta",
+                "reference_after_load_max_delta", "reference_after_load_repeat_max_delta",
+                "adapter_after_reference_max_delta", "reload_max_delta",
+                "reference_observed_max_delta", "adapter_observed_max_delta",
+            )
+            observed_noise = max(evidence[key] for key in stability_metrics)
+            evidence["observed_null_max_delta"] = observed_noise
             # Keep measured paths and vectors even when a parity assertion
             # rejects the adapter; failing early would hide the controls that
             # distinguish a path difference from unstable or ineffective loads.
             write_json(evidence_path, evidence)
+            for key in stability_metrics:
+                if evidence[key] > 1e-5:
+                    raise ValueError(f"fixed-sequence native stability failed: {key} exceeds 1e-5")
             if parent is None:
                 if effect > noise + 1e-5:
                     raise ValueError("bootstrap zero-delta adapter does not reproduce the base")
-            elif effect <= noise:
-                raise ValueError("candidate has no native adapter effect above repeated-incumbent noise")
-            if reload_delta > 1e-5:
-                raise ValueError("identical adapter reload changed fixed-sequence probabilities")
+            elif effect <= observed_noise:
+                raise ValueError("candidate has no native adapter effect above observed null/repeat/alias noise")
         except BaseException as exc:
             evidence.update(status="failed", error_type=type(exc).__name__, error=str(exc))
             write_json(evidence_path, evidence)
