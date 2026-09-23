@@ -149,12 +149,25 @@ def test_reload_proof_rejects_no_effect_noise_and_unstable_reload():
 
 
 @pytest.mark.parametrize(("completion", "reference", "expected"), [
-    ("The calculation is 1,200. #### 1,200", "explanation #### 1200", 1),
-    ("\\boxed{42}", "#### 42", 1), ("42", "#### 42", 1),
+    ("The calculation is 1,200.\n#### 1,200", "explanation\n#### 1200", 1),
+    ("\\boxed{42}", "#### 42", 0), ("42", "#### 42", 0),
     ("#### -3.5", "#### -3.50", 1), ("", "#### 42", 0), ("#### 4", "#### 42", 0),
+    ("Calculation\n  #### +1,200.00 \t\n\n", "#### 1200", 1),
+    ("#### -.5", "#### -0.50", 1),
+    ("#### 0", "#### 0", 1),
+    ("#### 1,20", "#### 120", 0),
+    ("#### 42\nHere is more reasoning.", "#### 42", 0),
+    ("#### 42 dollars", "#### 42", 0),
+    ("My answer is #### 42", "#### 42", 0),
+    ("####\n42", "#### 42", 0),
 ])
 def test_gsm8k_numeric_verifier(completion, reference, expected):
     assert gsm8k_reward(completion, reference) == expected
+
+
+def test_truncated_reasoning_with_correct_last_number_is_not_an_answer():
+    assert gsm8k_reward("She has enough time to enter 3 races", "Solution\n#### 3") == 0
+    assert gsm8k_reward("She has enough time to enter 3 races\n#### 3", "Solution\n#### 3") == 1
 
 
 def test_prompt_disables_thinking():

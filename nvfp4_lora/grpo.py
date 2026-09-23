@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 import torch
 from torch import Tensor
@@ -125,22 +125,19 @@ def behavior_metrics(old: Tensor, behavior: Tensor, mask: Tensor, tis_min=0.1, t
     }
 
 
-_NUMBER = r"[-+]?(?:\d[\d,]*)(?:\.\d+)?"
-_FINAL = re.compile(r"####\s*\$?(" + _NUMBER + r")")
-_BOXED = re.compile(r"\\boxed\{\s*\$?(" + _NUMBER + r")\s*\}")
+_NUMBER = r"[-+]?(?:(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?|\.[0-9]+)"
+_FINAL = re.compile(r"^[ \t]*####[ \t]*(" + _NUMBER + r")[ \t]*\s*\Z", re.MULTILINE)
 
 
-def _number(text: str) -> Decimal | None:
-    try:
-        return Decimal(text.replace(",", ""))
-    except InvalidOperation:
-        return None
+def _final_number(text: str) -> Decimal | None:
+    match = _FINAL.search(text)
+    return Decimal(match.group(1).replace(",", "")) if match else None
 
 
 def gsm8k_reward(completion: str, answer: str) -> float:
-    gold = _FINAL.findall(answer)
-    predicted = _FINAL.findall(completion) or _BOXED.findall(completion) or re.findall(_NUMBER, completion)
-    return float(bool(gold and predicted) and _number(gold[-1]) == _number(predicted[-1]))
+    gold = _final_number(answer)
+    predicted = _final_number(completion)
+    return float(gold is not None and predicted == gold)
 
 
 def prompt_ids(tokenizer, question: str) -> list[int]:

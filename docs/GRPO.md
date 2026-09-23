@@ -81,9 +81,13 @@ reported.
 Sixteen held-out `test` rows are selected before training using seed 43 and
 evaluated greedily before and after. Thinking is disabled in the chat template;
 the prompt asks for a concise calculation followed by `#### <number>`. The
-verifier compares the final `####` number, otherwise a boxed number, otherwise
-the last numeric substring. This permissive fallback is part of the recorded
-reward definition. The runner rejects prompts that exceed the model context
+verifier requires the final nonempty line to contain only `#### <number>`.
+It accepts whitespace, signed numbers, valid thousands separators, and decimal
+values. A boxed answer, a trailing number in unfinished reasoning, or a final
+answer followed by prose receives zero reward. The current verifier has no
+fallback; the [recorded smoke report](GRPO_SMOKE.md) distinguishes its historical
+permissive scores from an offline audit using this stricter contract.
+The runner rejects prompts that exceed the model context
 budget rather than silently truncating them.
 
 ## Evidence and interpretation
