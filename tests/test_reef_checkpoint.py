@@ -112,7 +112,9 @@ def test_exact_capture_and_complete_group():
 
 @pytest.mark.parametrize("key,value", [("rollout_log_probs", [float("nan")]), ("loss_mask", [0]),
                                       ("tokens", [1, 3]), ("runtime_load_id", "wrong"),
-                                      ("completion_token_ids", [True]), ("finish_reason", "abort")])
+                                      ("completion_token_ids", [True]), ("finish_reason", "abort"),
+                                      ("output_index", False), ("response_length", True),
+                                      ("loss_mask", [True])])
 def test_invalid_native_capture(key, value):
     native = capture()
     native[key] = value

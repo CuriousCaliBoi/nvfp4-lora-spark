@@ -82,16 +82,17 @@ def validate_capture(capture: dict, runtime_load_id: str) -> None:
         raise ValueError("native prompt and completion token IDs required")
     if capture.get("tokens") != prompt + completion:
         raise ValueError("native concatenated token IDs disagree")
-    if capture.get("prompt_length") != len(prompt) or capture.get("response_length") != len(completion):
+    if (type(capture.get("prompt_length")) is not int or type(capture.get("response_length")) is not int
+            or capture["prompt_length"] != len(prompt) or capture["response_length"] != len(completion)):
         raise ValueError("native capture length mismatch")
-    if capture.get("loss_mask") != [1] * len(completion):
+    if capture.get("loss_mask") != [1] * len(completion) or any(type(value) is not int for value in capture["loss_mask"]):
         raise ValueError("completion-only loss mask required")
     logps = capture.get("rollout_log_probs")
     if not isinstance(logps, list) or len(logps) != len(completion) or any(
         type(x) not in (int, float) or not math.isfinite(x) or x > 1e-5 for x in logps
     ):
         raise ValueError("one finite native log probability per completion token required")
-    if capture.get("output_index") != 0 or capture.get("finish_reason") not in ("stop", "length"):
+    if type(capture.get("output_index")) is not int or capture["output_index"] != 0 or capture.get("finish_reason") not in ("stop", "length"):
         raise ValueError("unsupported native output index or finish reason")
     if not runtime_load_id or capture.get("runtime_load_id") != runtime_load_id:
         raise ValueError("producing runtime identities disagree")
@@ -122,6 +123,8 @@ def validate_rows(rows: list[dict], *, complete=True) -> list[dict]:
                 raise ValueError(f"missing {key}")
         if row["dataset_id"] != "openai/gsm8k" or row["dataset_split"] != "train":
             raise ValueError("training requires GSM8K train provenance")
+        if _final_number(row["gold_answer"]) is None:
+            raise ValueError("gold answer requires a final numeric marker")
         slot = row["group_id"], row["rollout_id"]
         if slot in seen or row["source_agent_record_id"] in sources or row["report_agent_record_id"] in reports:
             raise ValueError("duplicate rollout, source or report")
