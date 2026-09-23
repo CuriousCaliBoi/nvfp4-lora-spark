@@ -29,6 +29,7 @@ from reef.runtime.interfaces import (
 )
 
 from .reef_checkpoint import canonical_json, materialize_checkpoint, validate_checkpoint, write_json
+from .reef_marlin_patch import validate_actor_patch_contract
 
 
 _SAMPLING = {
@@ -194,6 +195,7 @@ class VllmInferenceRuntime(InferenceRuntime):
     def _validate_actor_contract(self) -> str:
         raw = self._contract_path.read_bytes()
         contract = json.loads(raw)
+        validate_actor_patch_contract(contract)
         expected = {
             "schema_version": 1, "actor_instance_id": self._actor,
             "base_model": self._model, "model_revision": self._revision,

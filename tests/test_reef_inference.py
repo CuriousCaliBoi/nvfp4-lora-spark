@@ -22,6 +22,9 @@ from nvfp4_lora.reef_checkpoint import (
 )
 from nvfp4_lora.reef_data import normalized_config, validate_capture
 from nvfp4_lora.reef_inference import VllmInferenceRuntime, chat_request, native_capture
+from nvfp4_lora.reef_marlin_patch import (
+    MARLIN_BASE_IMAGE_ID, MARLIN_PATCH_MANIFEST, MARLIN_PATCH_MANIFEST_SHA256,
+)
 
 
 def checkpoint(root, *, parent=None, step=0, batch="b" * 64):
@@ -47,6 +50,10 @@ def actor_contract(directory):
     directory.mkdir(parents=True, exist_ok=True)
     write_json(directory / "actor-contract.json", {
         "schema_version": 1, "actor_instance_id": "actor-owned-one", "container_id": "container-one",
+        "image_id": "sha256:" + "a" * 64, "base_image_id": MARLIN_BASE_IMAGE_ID,
+        "marlin_patch": MARLIN_PATCH_MANIFEST,
+        "marlin_patch_manifest_sha256": MARLIN_PATCH_MANIFEST_SHA256,
+        "marlin_installed_source_sha256": MARLIN_PATCH_MANIFEST["patched_sha256"],
         "base_model": "test-model", "model_revision": "revision", "vllm_version": "0.27.1",
         "logprobs_mode": "processed_logprobs", "generation_config": "vllm",
         "speculative_decoding": False, "exclusive_adapter_control": True, "async_scheduling": False,
@@ -586,6 +593,34 @@ def test_incompatible_sampling_attestation_fails_before_native_load(rig):
     write_json(path, value)
     before = len(rig.actor.calls)
     with pytest.raises(ValueError, match="attestation"):
+        VllmInferenceRuntime(**rig.options)
+    assert len(rig.actor.calls) == before
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.pop("image_id"),
+    lambda value: value.update(image_id="research:latest"),
+    lambda value: value.update(image_id=MARLIN_BASE_IMAGE_ID),
+    lambda value: value.pop("base_image_id"),
+    lambda value: value.update(base_image_id="sha256:" + "b" * 64),
+    lambda value: value.pop("marlin_patch"),
+    lambda value: value["marlin_patch"].update(upstream_commit="b" * 40),
+    lambda value: value["marlin_patch"].update(schema_version=True),
+    lambda value: value["marlin_patch"].update(patched_sha256="b" * 64),
+    lambda value: value["marlin_patch"].update(helper_sha256="b" * 64),
+    lambda value: value["marlin_patch"].update(source_path="/unreviewed/module.py"),
+    lambda value: value.pop("marlin_patch_manifest_sha256"),
+    lambda value: value.update(marlin_patch_manifest_sha256="b" * 64),
+    lambda value: value.pop("marlin_installed_source_sha256"),
+    lambda value: value.update(marlin_installed_source_sha256="b" * 64),
+])
+def test_research_image_provenance_fails_before_any_native_call(rig, mutation):
+    path = rig.state / "actor-contract.json"
+    contract = json.loads(path.read_text())
+    mutation(contract)
+    write_json(path, contract)
+    before = len(rig.actor.calls)
+    with pytest.raises(ValueError, match="research-image provenance"):
         VllmInferenceRuntime(**rig.options)
     assert len(rig.actor.calls) == before
 

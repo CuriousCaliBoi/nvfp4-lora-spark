@@ -56,6 +56,9 @@ Repository = "https://github.com/NvMayMay/nvfp4-lora-spark"
 # distributed via the git clone, not vendored as package data.
 packages = ["nvfp4_lora", "nvfp4_lora.vllm_plugins", "nybbloris"]
 
+[tool.setuptools.package-data]
+nvfp4_lora = ["vendor/*.patch", "vendor/*.md", "vendor/LICENSE"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
