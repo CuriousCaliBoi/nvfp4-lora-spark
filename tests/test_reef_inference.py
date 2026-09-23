@@ -73,6 +73,8 @@ class FakeActor:
         self.fail_load = False
         self.ignore_adapters = False
         self.reload_error = 0.0
+        self.adapter_path_offset = 0.0
+        self.probe_mutation = None
         self.chat_hook = None
         self.chat_mutation = None
 
@@ -96,9 +98,14 @@ class FakeActor:
             if model != "test-model" and not self.ignore_adapters:
                 step = json.loads((Path(self.registry[model]["root"]) / "adapter_model.safetensors").read_text())["step"]
             offset = self.reload_error if model.endswith("-reload") else 0.0
-            return {"model": model, "choices": [{"index": 0, "prompt_token_ids": tokens,
+            if model != "test-model":
+                offset += self.adapter_path_offset
+            result = {"model": model, "choices": [{"index": 0, "prompt_token_ids": tokens,
                     "prompt_logprobs": [None] + [{str(token): {"logprob": -token / 10 + step / 100 + offset}}
                                                  for token in tokens[1:]]}]}
+            if self.probe_mutation:
+                self.probe_mutation(result)
+            return result
         if path == "/v1/chat/completions":
             if self.chat_hook:
                 hook, self.chat_hook = self.chat_hook, None
@@ -198,6 +205,62 @@ def test_private_verification_and_evaluation_do_not_publish(rig):
     assert rig.runtime.current_runtime_load_id() == original
     assert rig.runtime.serving_runtime_load_id() == original
     assert rig.runtime.pending_training_job_id is None
+
+
+def test_failed_bootstrap_preserves_alias_repeats_and_interleaved_native_evidence(rig):
+    rig.actor.adapter_path_offset = .125
+    with pytest.raises(ValueError, match="bootstrap zero-delta adapter does not reproduce the base"):
+        VllmInferenceRuntime(**rig.options)
+    attempts = [json.loads(path.read_text()) for path in
+                (rig.state / "native-probes" / rig.base.name).glob("*/evidence.json")]
+    failed, = [value for value in attempts if value["status"] == "failed"]
+    assert failed["bootstrap"] and not failed["native_verified"]
+    assert failed["stage"] == "validation"
+    assert failed["adapter_effect_max_delta"] == pytest.approx(.125)
+    for field in ("reference_repeat_max_delta", "adapter_repeat_max_delta", "reload_repeat_max_delta",
+                  "reload_max_delta", "reference_after_load_max_delta",
+                  "reference_after_load_repeat_max_delta", "adapter_after_reference_max_delta"):
+        assert failed[field] == 0
+    assert set(failed["completed_probes"]) == {
+        "reference_logprobs", "reference_repeat_logprobs", "adapter_logprobs", "adapter_repeat_logprobs",
+        "reload_logprobs", "reload_repeat_logprobs", "reference_after_load_logprobs",
+        "reference_after_load_repeat_logprobs", "adapter_after_reference_logprobs",
+    }
+    for key, location in failed["raw_probe_paths"].items():
+        raw = json.loads(Path(location).read_text())
+        assert raw["request"]["prompt"] == [1, 2, 3]
+        assert raw["request"]["temperature"] == 1.0
+        assert raw["response"]["model"] == raw["request"]["model"]
+        assert raw["response"]["choices"][0]["prompt_token_ids"] == [1, 2, 3]
+        assert failed[key] == [row[str(token)]["logprob"] for token, row in
+                               zip([2, 3], raw["response"]["choices"][0]["prompt_logprobs"][1:])]
+    assert failed["adapter_name"] in rig.actor.registry
+    assert failed["reload_name"] in rig.actor.registry
+
+
+def test_native_load_failure_preserves_completed_reference_probes(rig):
+    rig.actor.fail_load = True
+    with pytest.raises(UpstreamStatusError, match="test load failure"):
+        rig.runtime.verification(rig.candidate_path)
+    evidence_path, = (rig.state / "native-probes" / rig.candidate_path.name).glob("*/evidence.json")
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["status"] == "failed" and not evidence["native_verified"]
+    assert evidence["stage"] == "load_primary"
+    assert evidence["completed_probes"] == ["reference_logprobs", "reference_repeat_logprobs"]
+    assert all(Path(path).is_file() for path in evidence["raw_probe_paths"].values())
+
+
+def test_native_response_is_preserved_before_alignment_validation(rig):
+    rig.actor.probe_mutation = lambda result: result["choices"][0].update(prompt_token_ids=[99])
+    with pytest.raises(ValueError, match="changed native prompt IDs"):
+        rig.runtime.verification(rig.candidate_path)
+    evidence_path, = (rig.state / "native-probes" / rig.candidate_path.name).glob("*/evidence.json")
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["status"] == "failed"
+    assert evidence["completed_probes"] == []
+    raw = json.loads(Path(evidence["raw_probe_paths"]["reference_logprobs"]).read_text())
+    assert raw["request"]["prompt"] == [1, 2, 3]
+    assert raw["response"]["choices"][0]["prompt_token_ids"] == [99]
 
 
 def test_candidate_requires_matching_durable_acknowledgement(rig):

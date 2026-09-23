@@ -267,14 +267,17 @@ class VllmInferenceRuntime(InferenceRuntime):
         if not self._registry_binding(name, path):
             raise ValueError("vLLM acknowledged loading without the required adapter association")
 
-    def _probe(self, model: str) -> list[float]:
-        response = self._http("POST", "/v1/completions", {
+    def _probe(self, model: str, *, evidence_path: Path | None = None) -> list[float]:
+        request = {
             "model": model, "prompt": self._probe_ids, "max_tokens": 1,
             "temperature": 1.0, "top_p": 1.0, "top_k": -1, "min_p": 0.0,
             "frequency_penalty": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0,
             "logit_bias": {}, "n": 1, "seed": 43, "prompt_logprobs": 0,
             "logprobs": 0, "return_token_ids": True,
-        })
+        }
+        response = self._http("POST", "/v1/completions", request)
+        if evidence_path is not None:
+            write_json(evidence_path, {"request": request, "response": response})
         choices = response.get("choices", []) if isinstance(response, dict) else []
         if not isinstance(response, dict) or response.get("model") != model or len(choices) != 1 or choices[0].get("index") != 0:
             raise ValueError("fixed-sequence response selected a different native model/output")
@@ -305,8 +308,6 @@ class VllmInferenceRuntime(InferenceRuntime):
             return existing
         parent = manifest["parent_checkpoint_id"]
         reference = self._model if parent is None else self._ensure_verified(self._root / parent).name
-        first, repeated = self._probe(reference), self._probe(reference)
-        noise = _maximum_delta(first, repeated)
         fingerprint = hashlib.sha256(canonical_json({
             "actor": self._actor, "checkpoint": identity, "base_model": self._model,
             "revision": self._revision, "weights": manifest["adapter_sha256"],
@@ -314,31 +315,77 @@ class VllmInferenceRuntime(InferenceRuntime):
         })).hexdigest()
         name, reload_name = f"reef-nvfp4-{fingerprint}-primary", f"reef-nvfp4-{fingerprint}-reload"
         actor_path = str(self._actor_root / identity / "adapter")
-        self._load_alias(name, actor_path)
-        scores = self._probe(name)
-        effect = _maximum_delta(first, scores)
-        if parent is None:
-            if effect > noise + 1e-5:
-                raise ValueError("bootstrap zero-delta adapter does not reproduce the base")
-        elif effect <= noise:
-            raise ValueError("candidate has no native adapter effect above repeated-incumbent noise")
-        self._load_alias(reload_name, actor_path)
-        reloaded = self._probe(reload_name)
-        reload_delta = _maximum_delta(scores, reloaded)
-        if reload_delta > 1e-5:
-            raise ValueError("identical adapter reload changed fixed-sequence probabilities")
+        attempt_id = uuid.uuid4().hex
+        attempt_dir = self._state_dir / "native-probes" / identity / attempt_id
+        attempt_dir.mkdir(parents=True)
+        evidence_path = attempt_dir / "evidence.json"
         evidence = {
+            "schema_version": 1, "attempt_id": attempt_id, "status": "collecting",
             "actor_instance_id": self._actor, "actor_contract_sha256": self._contract_hash,
             "checkpoint_id": identity, "adapter_name": name, "reload_name": reload_name,
             "adapter_sha256": manifest["adapter_sha256"],
             "adapter_config_sha256": manifest["files"]["adapter/adapter_config.json"],
             "probe_token_ids": self._probe_ids, "reference_name": reference,
-            "reference_logprobs": first, "reference_repeat_logprobs": repeated,
-            "adapter_logprobs": scores, "reload_logprobs": reloaded,
-            "reference_repeat_max_delta": noise, "adapter_effect_max_delta": effect,
-            "reload_max_delta": reload_delta, "bootstrap": parent is None,
-            "native_verified": True,
+            "bootstrap": parent is None, "native_verified": False,
+            "evidence_path": str(evidence_path), "raw_probe_paths": {}, "completed_probes": [],
         }
+
+        def record_probe(key: str, selector: str) -> list[float]:
+            raw_path = attempt_dir / f"{len(evidence['completed_probes']):02d}-{key}.json"
+            evidence["stage"] = key
+            evidence["raw_probe_paths"][key] = str(raw_path)
+            write_json(evidence_path, evidence)
+            scores = self._probe(selector, evidence_path=raw_path)
+            evidence[key] = scores
+            evidence["completed_probes"].append(key)
+            write_json(evidence_path, evidence)
+            return scores
+
+        try:
+            first = record_probe("reference_logprobs", reference)
+            repeated = record_probe("reference_repeat_logprobs", reference)
+            evidence["stage"] = "load_primary"
+            write_json(evidence_path, evidence)
+            self._load_alias(name, actor_path)
+            scores = record_probe("adapter_logprobs", name)
+            adapter_repeat = record_probe("adapter_repeat_logprobs", name)
+            evidence["stage"] = "load_reload"
+            write_json(evidence_path, evidence)
+            self._load_alias(reload_name, actor_path)
+            reloaded = record_probe("reload_logprobs", reload_name)
+            reload_repeat = record_probe("reload_repeat_logprobs", reload_name)
+            reference_after = record_probe("reference_after_load_logprobs", reference)
+            reference_after_repeat = record_probe("reference_after_load_repeat_logprobs", reference)
+            adapter_after = record_probe("adapter_after_reference_logprobs", name)
+            noise = _maximum_delta(first, repeated)
+            effect = _maximum_delta(first, scores)
+            reload_delta = _maximum_delta(scores, reloaded)
+            evidence.update(
+                status="measured", stage="validation", reference_repeat_max_delta=noise,
+                adapter_effect_max_delta=effect, reload_max_delta=reload_delta,
+                adapter_repeat_max_delta=_maximum_delta(scores, adapter_repeat),
+                reload_repeat_max_delta=_maximum_delta(reloaded, reload_repeat),
+                reference_after_load_max_delta=_maximum_delta(first, reference_after),
+                reference_after_load_repeat_max_delta=_maximum_delta(reference_after, reference_after_repeat),
+                adapter_after_reference_max_delta=_maximum_delta(scores, adapter_after),
+            )
+            # Keep measured paths and vectors even when a parity assertion
+            # rejects the adapter; failing early would hide the controls that
+            # distinguish a path difference from unstable or ineffective loads.
+            write_json(evidence_path, evidence)
+            if parent is None:
+                if effect > noise + 1e-5:
+                    raise ValueError("bootstrap zero-delta adapter does not reproduce the base")
+            elif effect <= noise:
+                raise ValueError("candidate has no native adapter effect above repeated-incumbent noise")
+            if reload_delta > 1e-5:
+                raise ValueError("identical adapter reload changed fixed-sequence probabilities")
+        except BaseException as exc:
+            evidence.update(status="failed", error_type=type(exc).__name__, error=str(exc))
+            write_json(evidence_path, evidence)
+            raise
+        evidence.update(status="passed", native_verified=True)
+        write_json(evidence_path, evidence)
         binding = AdapterBinding(identity, path, name, reload_name, actor_path,
                                  manifest["adapter_sha256"], manifest["files"]["adapter/adapter_config.json"], evidence)
         self._verified[identity] = binding
