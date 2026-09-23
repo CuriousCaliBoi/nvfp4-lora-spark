@@ -1,0 +1,411 @@
+"""CPU HTTP doubles verify contracts; they are not native model evidence."""
+
+import asyncio
+import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from reef.artifact.artifact import Artifact, LiveWeightArtifactRef
+from reef.runtime.interfaces import ModelCandidate, TrainingRuntime, UpstreamStatusError
+from reef.train.backend import PreparedStep
+from reef.train.runtime_backend import RuntimeCandidateBackend
+from reef.surface.weights import WeightLoader
+
+from nvfp4_lora.reef_checkpoint import (
+    PAYLOAD_FILES, checkpoint_identity, content_hash, publish_checkpoint, write_json,
+)
+from nvfp4_lora.reef_data import normalized_config, validate_capture
+from nvfp4_lora.reef_inference import VllmInferenceRuntime, chat_request, native_capture
+
+
+def checkpoint(root, *, parent=None, step=0, batch="b" * 64):
+    config = normalized_config()
+    manifest = dict(schema_version=1, scenario="test", base_model="test-model", model_revision="revision",
+                    model_config_sha256="c" * 64, frozen_tensor_sha256="f" * 64, lora_rank=8,
+                    lora_alpha=16, optimizer_step=step, config=config, config_sha256=content_hash(config),
+                    parent_checkpoint_id=parent, batch_sha256=batch if parent else None,
+                    training_job_id="pending" if parent else None)
+    manifest["checkpoint_id"] = checkpoint_identity(manifest)
+    if parent:
+        manifest["training_job_id"] = manifest["checkpoint_id"]
+    staging = root / f"staging-{step}-{batch[:4]}"
+    staging.mkdir(parents=True)
+    for name in PAYLOAD_FILES:
+        target = staging / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({"step": step}))
+    return publish_checkpoint(staging, root / manifest["checkpoint_id"], manifest)
+
+
+def actor_contract(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    write_json(directory / "actor-contract.json", {
+        "schema_version": 1, "actor_instance_id": "actor-owned-one", "container_id": "container-one",
+        "base_model": "test-model", "model_revision": "revision", "vllm_version": "0.27.1",
+        "logprobs_mode": "processed_logprobs", "generation_config": "vllm",
+        "speculative_decoding": False, "exclusive_adapter_control": True,
+        "command": ["vllm", "serve", "/hf", "--enable-lora", "--logprobs-mode", "processed_logprobs",
+                    "--generation-config", "vllm", "--max-cpu-loras", "16"],
+    })
+
+
+def response(model="adapter", *, finish="stop", text="#### 3"):
+    return {
+        "id": "chatcmpl-test", "model": model, "prompt_token_ids": [1, 2],
+        "choices": [{"index": 0, "token_ids": [3, 4], "message": {"role": "assistant", "content": text},
+                     "finish_reason": finish, "logprobs": {"content": [
+                         {"token": "token_id:3", "logprob": -1.0}, {"token": "token_id:4", "logprob": -2.0}]}}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+    }
+
+
+class FakeActor:
+    def __init__(self):
+        self.registry = {"test-model": {"id": "test-model", "root": "/hf", "parent": None}}
+        self.calls = []
+        self.loads = []
+        self.fail_load = False
+        self.ignore_adapters = False
+        self.reload_error = 0.0
+        self.chat_hook = None
+        self.chat_mutation = None
+
+    def request(self, method, path, payload=None):
+        self.calls.append((method, path, copy.deepcopy(payload)))
+        if path == "/version":
+            return {"version": "0.27.1"}
+        if path == "/v1/models":
+            return {"data": list(self.registry.values())}
+        if path == "/v1/load_lora_adapter":
+            if self.fail_load:
+                raise UpstreamStatusError("test load failure", status=500)
+            name, location = payload["lora_name"], payload["lora_path"]
+            assert name not in self.registry
+            self.loads.append(name)
+            self.registry[name] = {"id": name, "root": location, "parent": "test-model"}
+            return "Success: adapter added"
+        if path == "/v1/completions":
+            model, tokens = payload["model"], payload["prompt"]
+            step = 0
+            if model != "test-model" and not self.ignore_adapters:
+                step = json.loads((Path(self.registry[model]["root"]) / "adapter_model.safetensors").read_text())["step"]
+            offset = self.reload_error if model.endswith("-reload") else 0.0
+            return {"model": model, "choices": [{"index": 0, "prompt_token_ids": tokens,
+                    "prompt_logprobs": [None] + [{str(token): {"logprob": -token / 10 + step / 100 + offset}}
+                                                 for token in tokens[1:]]}]}
+        if path == "/v1/chat/completions":
+            if self.chat_hook:
+                hook, self.chat_hook = self.chat_hook, None
+                hook()
+            result = response(payload["model"])
+            if self.chat_mutation:
+                self.chat_mutation(result, payload)
+            return result
+        raise AssertionError((method, path, payload))
+
+
+@pytest.fixture
+def rig(tmp_path, monkeypatch):
+    root, state = tmp_path / "checkpoints", tmp_path / "serving"
+    base = checkpoint(root)
+    actor_contract(state)
+    actor = FakeActor()
+    monkeypatch.setattr(VllmInferenceRuntime, "_http", lambda self, *args, **kwargs: actor.request(*args, **kwargs))
+    options = dict(base_url="http://actor.invalid", actor_instance_id="actor-owned-one", base_model="test-model",
+                   model_revision="revision", checkpoint_root=root, base_checkpoint=base, state_dir=state,
+                   probe_token_ids=[1, 2, 3])
+    runtime = VllmInferenceRuntime(**options)
+    artifact = Artifact.local(base)
+    runtime.activate_checkpoint(artifact)
+    candidate_path = checkpoint(root, parent=base.name, step=1)
+    candidate = ModelCandidate(candidate_id=candidate_path.name, training_job_id=candidate_path.name,
+                               checkpoint_path=str(candidate_path), current_runtime_load_id=runtime.current_runtime_load_id())
+    return SimpleNamespace(runtime=runtime, actor=actor, root=root, state=state, base=base,
+                           artifact=artifact, candidate=candidate, candidate_path=candidate_path, options=options)
+
+
+def test_exact_native_capture_preserves_provider_response(rig):
+    result = asyncio.run(rig.runtime.inference_handler.inference(rig.artifact, "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "One plus two?"}], "temperature": 1.2, "seed": 7,
+    }))
+    native = result["training"]
+    validate_capture(native, rig.runtime.current_runtime_load_id())
+    assert native["tokens"] == [1, 2, 3, 4]
+    assert native["loss_mask"] == [1, 1]
+    assert native["sampling"]["seed"] == 7
+    assert result["choices"][0]["message"]["content"] == "#### 3"
+    assert result["model"].startswith("reef-nvfp4-")
+    request = next(body for _, path, body in reversed(rig.actor.calls) if path.endswith("chat/completions"))
+    assert request["return_token_ids"] and request["return_tokens_as_token_ids"]
+    assert request["logprobs"] and request["top_logprobs"] == 0
+    assert rig.runtime.serving_adapter_name() is None
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda r: r.pop("prompt_token_ids"),
+    lambda r: r["choices"][0].pop("token_ids"),
+    lambda r: r["choices"][0]["logprobs"]["content"].pop(),
+    lambda r: r["choices"][0]["logprobs"]["content"][0].update(token="token_id:99"),
+    lambda r: r["choices"][0]["logprobs"]["content"][0].update(logprob=float("nan")),
+    lambda r: r["choices"][0]["token_ids"].__setitem__(0, True),
+    lambda r: r["usage"].update(completion_tokens=99),
+    lambda r: r["choices"][0].update(finish_reason="tool_calls"),
+    lambda r: r["choices"][0]["message"].update(reasoning="hidden reasoning"),
+    lambda r: r.update(model="another-adapter"),
+])
+def test_malformed_native_receipts_fail_closed(mutate):
+    value = response()
+    mutate(value)
+    with pytest.raises(ValueError):
+        native_capture(value, expected_model="adapter")
+
+
+def test_length_limited_prefix_keeps_every_actual_token():
+    value = native_capture(response(finish="length"), expected_model="adapter")
+    assert value["completion_token_ids"] == [3, 4]
+    assert value["finish_reason"] == "length"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("stream", True), ("n", 2), ("temperature", 1), ("top_p", .9), ("top_k", 40), ("min_p", .1),
+    ("presence_penalty", .1), ("frequency_penalty", .1), ("repetition_penalty", 1.1),
+    ("logit_bias", {"1": 3}), ("tools", []), ("response_format", {"type": "json_object"}),
+    ("allowed_token_ids", [1, 2]), ("bad_words", ["a"]), ("logits_processors", []),
+    ("lora_path", "client-adapter"), ("model", "client-adapter"), ("seed", True),
+    ("chat_template_kwargs", {"enable_thinking": True}), ("max_tokens", 257),
+])
+def test_unsupported_learning_requests(field, value):
+    with pytest.raises(UpstreamStatusError):
+        chat_request({"messages": [{"role": "user", "content": "q"}], field: value}, base_model="test-model")
+
+
+def test_private_verification_and_evaluation_do_not_publish(rig):
+    original = rig.runtime.current_runtime_load_id()
+    proof = rig.runtime.verification(rig.candidate_path)
+    assert proof["adapter_effect_max_delta"] > proof["reference_repeat_max_delta"]
+    assert proof["reload_max_delta"] == 0
+    assert len(rig.actor.loads) == 4
+    results = rig.runtime.evaluate_adapter(rig.candidate_path, [{
+        "messages": [{"role": "user", "content": "q"}], "temperature": 0.0,
+    }])
+    assert "training" not in results[0]
+    assert rig.runtime.current_runtime_load_id() == original
+    assert rig.runtime.serving_runtime_load_id() == original
+    assert rig.runtime.pending_training_job_id is None
+
+
+def test_candidate_requires_matching_durable_acknowledgement(rig):
+    old = rig.runtime.current_runtime_load_id()
+    selected = rig.runtime.activate_candidate(rig.candidate)
+    assert selected.runtime_load_id != old
+    assert rig.runtime.current_runtime_load_id() == old
+    assert not rig.runtime.inference_admission_status["open"]
+    rig.runtime.resume_admission()
+    assert not rig.runtime.inference_admission_status["open"]
+    with pytest.raises(Exception, match="another checkpoint"):
+        rig.runtime.acknowledge_publication("wrong")
+    artifact = Artifact.local(rig.candidate_path)
+    assert rig.runtime.activate_checkpoint(artifact) == selected.runtime_load_id
+    assert rig.runtime.current_runtime_load_id() == old
+    rig.runtime.acknowledge_publication(rig.candidate.training_job_id)
+    rig.runtime.mark_published()
+    rig.runtime.resume_admission()
+    assert rig.runtime.inference_admission_status["open"]
+    assert rig.runtime.current_runtime_load_id() == selected.runtime_load_id
+
+
+def test_request_pins_immutable_selector_across_head_change(rig):
+    old_binding, old_version = rig.runtime.snapshot(rig.artifact)
+    rig.actor.chat_hook = lambda: rig.runtime.activate_candidate(rig.candidate)
+    result = asyncio.run(rig.runtime.inference_handler.inference(rig.artifact, "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "q"}],
+    }))
+    assert result["model"] == old_binding.name
+    assert result["training"]["runtime_load_id"] == old_version
+    assert rig.runtime.serving_runtime_load_id() != old_version
+
+
+def test_publication_drains_real_reef_admission(rig):
+    async def run():
+        lease = await rig.runtime.acquire_inference()
+        activation = asyncio.create_task(asyncio.to_thread(rig.runtime.activate_candidate, rig.candidate))
+        await asyncio.sleep(.02)
+        assert not activation.done()
+        lease.release()
+        await activation
+    asyncio.run(run())
+
+
+class RejectOnlyTrainingRuntime(TrainingRuntime):
+    def prepare_training_step(self, *args, **kwargs):
+        raise AssertionError("test must not train")
+
+    def train_candidate(self, payload):
+        raise AssertionError("test must not train")
+
+    def reject_candidate(self, candidate, decision):
+        self.rejected = candidate.candidate_id
+
+
+def test_native_load_failure_remains_fenced_through_actual_reef_abort(rig):
+    training = RejectOnlyTrainingRuntime()
+    backend = RuntimeCandidateBackend(training, "test", inference_runtime=rig.runtime)
+    rig.actor.fail_load = True
+    with pytest.raises(UpstreamStatusError):
+        rig.runtime.activate_candidate(rig.candidate)
+    backend.abort_step(PreparedStep.with_candidate(rig.candidate, state={}, metrics={}))
+    assert training.rejected == rig.candidate.candidate_id
+    assert not rig.runtime.inference_admission_status["open"]
+    state = json.loads((rig.state / "serving-state.json").read_text())
+    assert state["fenced"]
+    rig.actor.fail_load = False
+    rig.runtime.activate_checkpoint(rig.artifact)
+    rig.runtime.mark_published()
+    rig.runtime.resume_admission()
+    assert rig.runtime.inference_admission_status["open"]
+
+
+@pytest.mark.parametrize("failure", ["ignored", "reload", "capacity", "registry"])
+def test_native_identity_failures_do_not_publish(rig, failure):
+    before = rig.runtime.current_runtime_load_id()
+    if failure == "ignored":
+        rig.actor.ignore_adapters = True
+    elif failure == "reload":
+        rig.actor.reload_error = .1
+    elif failure == "capacity":
+        rig.runtime._capacity = 2
+    else:
+        binding, _ = rig.runtime.snapshot(rig.artifact)
+        rig.actor.registry[binding.name]["root"] = "/wrong"
+    with pytest.raises((ValueError, RuntimeError)):
+        rig.runtime.verification(rig.candidate_path)
+    assert rig.runtime.current_runtime_load_id() == before
+    assert not rig.runtime.inference_admission_status["open"]
+
+
+def test_restart_reverifies_existing_names_and_rollback_mints_new_version(rig):
+    rig.runtime.activate_candidate(rig.candidate)
+    candidate_artifact = Artifact.local(rig.candidate_path)
+    rig.runtime.activate_checkpoint(candidate_artifact)
+    rig.runtime.acknowledge_publication(rig.candidate.training_job_id)
+    rig.runtime.mark_published()
+    previous = rig.runtime.current_runtime_load_id()
+    count = len(rig.actor.loads)
+    restarted = VllmInferenceRuntime(**rig.options)
+    assert not restarted.inference_admission_status["open"]
+    restored = restarted.activate_checkpoint(candidate_artifact)
+    assert restored != previous
+    assert restarted.current_runtime_load_id() == restored
+    assert len(rig.actor.loads) == count
+    restarted.restore_checkpoint(rig.artifact)
+    rollback = Artifact.local(rig.base)
+    version = restarted.activate_checkpoint(rollback)
+    assert version != restored
+    assert not restarted.inference_admission_status["open"]
+    restarted.mark_published()
+    restarted.resume_admission()
+    assert restarted.inference_admission_status["open"]
+    state = json.loads((rig.state / "serving-state.json").read_text())
+    assert state["active_checkpoint_id"] == rig.base.name
+
+
+def test_failed_rollback_restart_reconciles_both_sides_before_admission(rig):
+    rig.runtime.activate_candidate(rig.candidate)
+    committed = Artifact.local(rig.candidate_path)
+    rig.runtime.activate_checkpoint(committed)
+    rig.runtime.acknowledge_publication(rig.candidate.training_job_id)
+    rig.runtime.mark_published()
+    learner = SimpleNamespace(incumbent=rig.candidate_path)
+    old_version = rig.runtime.current_runtime_load_id()
+    learner.incumbent = rig.base
+    rig.runtime._verified.pop(rig.base.name)
+    rig.actor.reload_error = .1
+    with pytest.raises(ValueError, match="reload"):
+        WeightLoader().load(rig.artifact, rig.runtime)
+    assert learner.incumbent == rig.base
+    assert not rig.runtime.inference_admission_status["open"]
+    assert json.loads((rig.state / "serving-state.json").read_text())["fenced"]
+
+    rig.actor.reload_error = 0
+    callback_calls = []
+
+    def reconcile(artifact):
+        assert not restarted.inference_admission_status["open"]
+        learner.incumbent = artifact.materialize().local_path
+        callback_calls.append(learner.incumbent)
+
+    restarted = VllmInferenceRuntime(**rig.options, on_checkpoint_activation=reconcile)
+    old_live = LiveWeightArtifactRef("old-content", "old-live-release", None, old_version)
+    loader = WeightLoader()
+    recovered = loader.recover(old_live, committed.ref, restarted)
+    assert recovered == committed.ref
+    loader.activate(committed, restarted)
+    assert learner.incumbent == rig.candidate_path
+    assert callback_calls == [rig.candidate_path]
+    assert restarted.inference_admission_status["open"]
+    assert restarted.current_runtime_load_id() != old_version
+
+
+def test_reconciliation_callback_failure_stays_fenced(rig):
+    def fail(artifact):
+        raise RuntimeError("learner restore failed")
+    restarted = VllmInferenceRuntime(**rig.options, on_checkpoint_activation=fail)
+    with pytest.raises(RuntimeError, match="learner restore failed"):
+        WeightLoader().activate(rig.artifact, restarted)
+    restarted.resume_admission()
+    assert not restarted.inference_admission_status["open"]
+    assert json.loads((rig.state / "serving-state.json").read_text())["fenced"]
+
+
+def test_candidate_and_private_evaluation_never_restore_training_incumbent(rig):
+    calls = []
+    rig.runtime._on_checkpoint_activation = calls.append
+    rig.runtime.evaluate_adapter(rig.candidate_path, [{"messages": [{"role": "user", "content": "q"}],
+                                                    "temperature": 0.0}])
+    rig.runtime.activate_candidate(rig.candidate)
+    rig.runtime.activate_checkpoint(Artifact.local(rig.candidate_path))
+    assert calls == []
+
+
+def test_changed_actor_attestation_fences_requests(rig):
+    path = rig.state / "actor-contract.json"
+    path.write_text(path.read_text() + " ")
+    with pytest.raises(Exception, match="actor identity changed"):
+        rig.runtime.snapshot(rig.artifact)
+    assert not rig.runtime.inference_admission_status["open"]
+
+
+def test_incompatible_sampling_attestation_fails_before_native_load(rig):
+    path = rig.state / "actor-contract.json"
+    value = json.loads(path.read_text())
+    value["logprobs_mode"] = "raw_logprobs"
+    write_json(path, value)
+    before = len(rig.actor.calls)
+    with pytest.raises(ValueError, match="attestation"):
+        VllmInferenceRuntime(**rig.options)
+    assert len(rig.actor.calls) == before
+
+
+def test_streaming_is_explicitly_unsupported(rig):
+    with pytest.raises(UpstreamStatusError, match="streaming"):
+        asyncio.run(rig.runtime.inference_handler.inference_stream(rig.artifact, "/v1/chat/completions", {}))
+
+
+def test_serving_and_evaluation_import_without_torch():
+    source = """
+import builtins
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'torch' or name.startswith('torch.'):
+        raise AssertionError('CPU REEF imported torch')
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+import nvfp4_lora.reef_inference
+import nvfp4_lora.reef_evaluation
+"""
+    subprocess.run([sys.executable, "-c", source], check=True, capture_output=True, text=True)
