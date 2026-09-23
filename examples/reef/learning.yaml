@@ -1,0 +1,40 @@
+schema-version: 2
+reef:
+  host: 127.0.0.1
+  port: 8902
+  token: ${REEF_TOKEN}
+  run-dir: ${REEF_EXPERIMENT}/reef-stack
+  ready-timeout: 900
+inference:
+  model-path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+  timeout-s: 600
+recipe:
+  implementation: nvfp4_lora.reef_recipe:NVFP4Recipe
+  config:
+    group-size: 8
+    batch-group-count: 4
+training:
+  backend: nvfp4_lora.reef_deployment:Nvfp4Deployment
+  timeout-s: 3600
+  options:
+    state-root: ${REEF_EXPERIMENT}/learning
+    model-dir: ${REEF_MODEL_DIR}
+    model-revision: ${REEF_MODEL_REVISION}
+    reef-revision: b637cbe42393e91e8ee75af2179f844da586c3dd
+    scenario: nvfp4-gsm8k
+    actor-url: http://127.0.0.1:30001
+    actor-instance-id: ${REEF_ACTOR_INSTANCE}
+    worker-command: [/ABSOLUTE/PATH/TO/REVIEWED/WORKER-WRAPPER]
+    probe-token-ids: [1, 2]
+evaluation:
+  module: nvfp4_lora.reef_evaluation:Gsm8kEvaluationFactory
+  config:
+    holdout_path: ${REEF_DATA}/holdout.json
+    holdout_sha256: ${REEF_HOLDOUT_SHA256}
+    max_tokens: 256
+    seed: 43
+storage:
+  artifact-repository: ${REEF_EXPERIMENT}/artifacts.git
+  artifact-work-dir: ${REEF_EXPERIMENT}/artifact-work
+  artifact-cache-dir: ${REEF_EXPERIMENT}/artifact-cache
+  agent-record-dir: ${REEF_EXPERIMENT}/agent-record

@@ -1,0 +1,16 @@
+schema-version: 2
+reef:
+  host: 127.0.0.1
+  port: 8901
+  token: ${REEF_TOKEN}
+  run-dir: ${REEF_PROXY_STATE}/stack
+recipe:
+  implementation: recipe
+inference:
+  upstream-url: http://127.0.0.1:30000
+  upstream-model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+  timeout-s: 300
+storage:
+  artifact-work-dir: ${REEF_PROXY_STATE}/artifact-work
+  artifact-cache-dir: ${REEF_PROXY_STATE}/artifact-cache
+  agent-record-dir: ${REEF_PROXY_STATE}/agent-record
