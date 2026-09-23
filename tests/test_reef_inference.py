@@ -50,8 +50,12 @@ def actor_contract(directory):
         "base_model": "test-model", "model_revision": "revision", "vllm_version": "0.27.1",
         "logprobs_mode": "processed_logprobs", "generation_config": "vllm",
         "speculative_decoding": False, "exclusive_adapter_control": True, "async_scheduling": False,
+        "max_num_seqs": 1, "kv_cache_dtype": "bfloat16", "attention_backend": "TRITON_ATTN",
+        "mamba_cache_mode": "none", "cublas_workspace_config": ":4096:8",
         "command": ["vllm", "serve", "/hf", "--enable-lora", "--logprobs-mode", "processed_logprobs",
-                    "--generation-config", "vllm", "--max-cpu-loras", "16", "--no-async-scheduling"],
+                    "--generation-config", "vllm", "--max-cpu-loras", "16", "--no-async-scheduling",
+                    "--max-num-seqs", "1", "--kv-cache-dtype", "bfloat16",
+                    "--attention-backend", "TRITON_ATTN", "--mamba-cache-mode", "none"],
     })
 
 
@@ -601,6 +605,48 @@ def test_async_scheduling_attestation_requires_false_and_unambiguous_inspected_f
     write_json(path, value)
     before = len(rig.actor.calls)
     with pytest.raises(ValueError, match="attestation|inspected actor command"):
+        VllmInferenceRuntime(**rig.options)
+    assert len(rig.actor.calls) == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_num_seqs", 32), ("max_num_seqs", True), ("kv_cache_dtype", "fp8"),
+    ("attention_backend", "FLASHINFER"), ("mamba_cache_mode", "align"),
+    ("cublas_workspace_config", ":16:8"), ("cublas_workspace_config", None),
+])
+def test_conservative_profile_attestation_rejects_missing_or_mismatched_settings(rig, field, value):
+    path = rig.state / "actor-contract.json"
+    contract = json.loads(path.read_text())
+    if value is None:
+        contract.pop(field)
+    else:
+        contract[field] = value
+    write_json(path, contract)
+    before = len(rig.actor.calls)
+    with pytest.raises(ValueError, match="attestation"):
+        VllmInferenceRuntime(**rig.options)
+    assert len(rig.actor.calls) == before
+
+
+@pytest.mark.parametrize("option,value", [
+    ("--max-num-seqs", "32"), ("--kv-cache-dtype", "fp8"),
+    ("--attention-backend", "FLASHINFER"), ("--mamba-cache-mode", "align"),
+])
+@pytest.mark.parametrize("mutation", ["change", "remove", "repeat"])
+def test_conservative_profile_requires_matching_unambiguous_inspected_command(rig, option, value, mutation):
+    path = rig.state / "actor-contract.json"
+    contract = json.loads(path.read_text())
+    command = contract["command"]
+    index = command.index(option)
+    if mutation == "change":
+        command[index + 1] = value
+    elif mutation == "remove":
+        del command[index:index + 2]
+    else:
+        command.extend([option, value])
+    write_json(path, contract)
+    before = len(rig.actor.calls)
+    with pytest.raises(ValueError, match="inspected actor command|repeats"):
         VllmInferenceRuntime(**rig.options)
     assert len(rig.actor.calls) == before
 

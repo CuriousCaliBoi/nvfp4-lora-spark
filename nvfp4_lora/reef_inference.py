@@ -200,9 +200,13 @@ class VllmInferenceRuntime(InferenceRuntime):
             "vllm_version": "0.27.1", "logprobs_mode": "processed_logprobs",
             "generation_config": "vllm", "speculative_decoding": False,
             "exclusive_adapter_control": True,
+            "max_num_seqs": 1, "kv_cache_dtype": "bfloat16",
+            "attention_backend": "TRITON_ATTN", "mamba_cache_mode": "none",
+            "cublas_workspace_config": ":4096:8",
         }
         if (any(contract.get(key) != value for key, value in expected.items())
-                or contract.get("async_scheduling") is not False):
+                or contract.get("async_scheduling") is not False
+                or type(contract.get("max_num_seqs")) is not int):
             raise ValueError("actor startup attestation does not match the controlled learning actor")
         command = contract.get("command")
         if not isinstance(command, list) or not command or any(not isinstance(arg, str) for arg in command):
@@ -212,6 +216,10 @@ class VllmInferenceRuntime(InferenceRuntime):
         if (
             _option(command, "--logprobs-mode") != "processed_logprobs"
             or _option(command, "--generation-config") != "vllm"
+            or _option(command, "--max-num-seqs") != "1"
+            or _option(command, "--kv-cache-dtype") != "bfloat16"
+            or _option(command, "--attention-backend") != "TRITON_ATTN"
+            or _option(command, "--mamba-cache-mode") != "none"
             or "--enable-lora" not in command
             or "--no-async-scheduling" not in command
             or any(arg.split("=", 1)[0] == "--async-scheduling" for arg in command)
