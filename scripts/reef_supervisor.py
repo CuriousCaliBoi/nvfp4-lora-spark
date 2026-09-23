@@ -56,6 +56,7 @@ def actor_argv(args, image_id, owner):
             "-e", "HF_HOME=/hf", "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1",
             "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "VLLM_ALLOW_RUNTIME_LORA_UPDATING=1",
             "-e", "VLLM_CACHE_ROOT=/runtime/vllm", "-e", "TRITON_CACHE_DIR=/runtime/triton",
+            "-e", "CUBLAS_WORKSPACE_CONFIG=:4096:8",
             "-e", "HOME=/runtime/home", "-e", "XDG_CACHE_HOME=/runtime/xdg",
             "-v", f"{args.hf_cache}:/hf:ro", "-v", f"{args.output / 'actor-cache'}:/runtime",
             "-v", f"{state / 'checkpoints'}:{state / 'checkpoints'}:ro", image_id,
@@ -63,9 +64,10 @@ def actor_argv(args, image_id, owner):
             "--model", args.model_dir, "--served-model-name", MODEL,
             "--revision", args.model_revision, "--dtype", "bfloat16", "--enforce-eager",
             "--gpu-memory-utilization", "0.23", "--max-model-len", "1024",
-            "--max-num-batched-tokens", "1024", "--max-num-seqs", "32",
-            "--moe-backend", "marlin", "--mamba-backend", "flashinfer", "--mamba-cache-mode", "align",
-            "--kv-cache-dtype", "fp8", "--enable-lora", "--max-lora-rank", "8",
+            "--max-num-batched-tokens", "1024", "--max-num-seqs", "1",
+            "--moe-backend", "marlin", "--mamba-backend", "flashinfer", "--mamba-cache-mode", "none",
+            "--kv-cache-dtype", "bfloat16", "--attention-backend", "TRITON_ATTN",
+            "--enable-lora", "--max-lora-rank", "8",
             "--max-loras", "2", "--max-cpu-loras", "16", "--no-enable-prefix-caching", "--no-async-scheduling",
             "--logprobs-mode", "processed_logprobs", "--generation-config", "vllm", "--no-enable-log-requests"]
 
@@ -124,14 +126,24 @@ def worker_launcher(args):
 def actor_attestation(inspected, owner, revision, version):
     argv = [inspected["Path"], *inspected["Args"]]
     def value(flag):
-        return argv[argv.index(flag) + 1] if flag in argv else None
+        values = [arg.split("=", 1)[1] if "=" in arg else argv[i + 1]
+                  for i, arg in enumerate(argv) if arg.split("=", 1)[0] == flag]
+        if len(values) > 1:
+            raise ValueError("ambiguous inspected actor option: " + flag)
+        return values[0] if values else None
     expected = {"--logprobs-mode": "processed_logprobs", "--generation-config": "vllm",
-                "--max-lora-rank": "8", "--served-model-name": MODEL, "--revision": revision}
-    if any(value(k) != v for k, v in expected.items()) or "--enable-lora" not in argv:
+                "--max-lora-rank": "8", "--max-loras": "2", "--served-model-name": MODEL,
+                "--revision": revision, "--dtype": "bfloat16", "--gpu-memory-utilization": "0.23",
+                "--max-model-len": "1024", "--max-num-batched-tokens": "1024", "--max-num-seqs": "1",
+                "--moe-backend": "marlin", "--mamba-backend": "flashinfer", "--mamba-cache-mode": "none",
+                "--kv-cache-dtype": "bfloat16", "--attention-backend": "TRITON_ATTN"}
+    if (any(value(k) != v for k, v in expected.items())
+            or "--enable-lora" not in argv or "--enforce-eager" not in argv):
         raise ValueError("inspected actor command violates the controlled sampling contract")
     if any("speculative" in x for x in argv) or "--no-enable-prefix-caching" not in argv:
         raise ValueError("speculation and prefix caching must be disabled")
-    if "--no-async-scheduling" not in argv or "--async-scheduling" in argv:
+    if ("--no-async-scheduling" not in argv
+            or any(arg.split("=", 1)[0] == "--async-scheduling" for arg in argv)):
         raise ValueError("the controlled actor profile requires asynchronous scheduling disabled")
     if int(value("--max-cpu-loras") or 0) < 16 or version != "0.27.1":
         raise ValueError("unsupported actor version or insufficient adapter capacity")
@@ -140,10 +152,16 @@ def actor_attestation(inspected, owner, revision, version):
     env = inspected["Config"].get("Env", [])
     if "VLLM_ALLOW_RUNTIME_LORA_UPDATING=1" not in env:
         raise ValueError("actor does not enable runtime adapter loading")
+    workspace = [entry.split("=", 1)[1] for entry in env if entry.startswith("CUBLAS_WORKSPACE_CONFIG=")]
+    if workspace != [":4096:8"]:
+        raise ValueError("inspected actor environment violates the controlled cuBLAS workspace setting")
     return {"schema_version": 1, "actor_instance_id": owner, "container_id": inspected["Id"],
             "image_id": inspected["Image"], "base_model": MODEL, "model_revision": revision,
             "vllm_version": version, "logprobs_mode": "processed_logprobs", "generation_config": "vllm",
             "speculative_decoding": False, "async_scheduling": False,
+            "max_num_seqs": int(value("--max-num-seqs")), "kv_cache_dtype": value("--kv-cache-dtype"),
+            "attention_backend": value("--attention-backend"), "mamba_cache_mode": value("--mamba-cache-mode"),
+            "cublas_workspace_config": workspace[0],
             "exclusive_adapter_control": True, "command": argv}
 
 

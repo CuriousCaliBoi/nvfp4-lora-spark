@@ -36,7 +36,8 @@ def inspected_actor(args, owner):
     position = full.index("sha256:image")
     return {"Id": "actor-id", "Image": "sha256:image", "Path": "python3", "Args": full[position + 1:],
             "State": {"Running": True}, "Name": "/" + owner + "-actor",
-            "Config": {"Labels": {"nvfp4-reef.owner": owner}, "Env": ["VLLM_ALLOW_RUNTIME_LORA_UPDATING=1"]}}
+            "Config": {"Labels": {"nvfp4-reef.owner": owner},
+                       "Env": [full[i + 1] for i, arg in enumerate(full[:position]) if arg == "-e"]}}
 
 
 def test_actor_attestation_uses_inspected_command(settings):
@@ -49,13 +50,24 @@ def test_actor_attestation_uses_inspected_command(settings):
     assert result["container_id"] == "actor-id"
     assert result["speculative_decoding"] is False
     assert result["async_scheduling"] is False
+    assert result["max_num_seqs"] == 1
+    assert result["kv_cache_dtype"] == "bfloat16"
+    assert result["attention_backend"] == "TRITON_ATTN"
+    assert result["mamba_cache_mode"] == "none"
+    assert result["cublas_workspace_config"] == ":4096:8"
+    for flag, expected in {"--moe-backend": "marlin", "--mamba-backend": "flashinfer",
+                           "--gpu-memory-utilization": "0.23", "--max-model-len": "1024",
+                           "--max-lora-rank": "8"}.items():
+        assert item["Args"][item["Args"].index(flag) + 1] == expected
+    assert "--enforce-eager" in item["Args"]
+    assert "--no-enable-prefix-caching" in item["Args"]
     item["Args"][item["Args"].index("processed_logprobs")] = "raw_logprobs"
     with pytest.raises(ValueError, match="controlled sampling"):
         ops.actor_attestation(item, "owner", "abc", "0.27.1")
 
 
 @pytest.mark.parametrize("mutation", ["speculation", "version", "owner", "runtime-loading", "capacity",
-                                     "async-default", "async-enabled"])
+                                     "async-default", "async-enabled", "async-enabled-equals"])
 def test_actor_attestation_rejects_unreviewed_actor(settings, mutation):
     item = inspected_actor(settings, "owner")
     version = "0.27.1"
@@ -73,8 +85,36 @@ def test_actor_attestation_rejects_unreviewed_actor(settings, mutation):
         item["Args"].remove("--no-async-scheduling")
     if mutation == "async-enabled":
         item["Args"].append("--async-scheduling")
+    if mutation == "async-enabled-equals":
+        item["Args"].append("--async-scheduling=true")
     with pytest.raises(ValueError):
         ops.actor_attestation(item, "owner", "abc", version)
+
+
+@pytest.mark.parametrize("flag,alternate", [("--max-num-seqs", "32"), ("--kv-cache-dtype", "fp8"),
+                                           ("--attention-backend", "FLASH_ATTN"), ("--mamba-cache-mode", "align")])
+@pytest.mark.parametrize("mutation", ["missing", "changed", "conflicting"])
+def test_actor_attestation_rejects_profile_drift(settings, flag, alternate, mutation):
+    item = inspected_actor(settings, "owner")
+    position = item["Args"].index(flag)
+    if mutation == "missing":
+        del item["Args"][position:position + 2]
+    elif mutation == "changed":
+        item["Args"][position + 1] = alternate
+    else:
+        item["Args"].append(flag + "=" + alternate)
+    with pytest.raises(ValueError):
+        ops.actor_attestation(item, "owner", "abc", "0.27.1")
+
+
+@pytest.mark.parametrize("values", [[], ["CUBLAS_WORKSPACE_CONFIG=:16:8"],
+                                     ["CUBLAS_WORKSPACE_CONFIG=:4096:8", "CUBLAS_WORKSPACE_CONFIG=:16:8"]])
+def test_actor_attestation_requires_inspected_cublas_environment(settings, values):
+    item = inspected_actor(settings, "owner")
+    item["Config"]["Env"] = [entry for entry in item["Config"]["Env"]
+                              if not entry.startswith("CUBLAS_WORKSPACE_CONFIG=")] + values
+    with pytest.raises(ValueError, match="cuBLAS workspace"):
+        ops.actor_attestation(item, "owner", "abc", "0.27.1")
 
 
 def test_worker_launch_preserves_argv_paths_and_unique_ownership(settings):
