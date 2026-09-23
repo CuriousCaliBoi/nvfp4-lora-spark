@@ -137,6 +137,7 @@ class FakeDocker:
 @pytest.mark.parametrize("outcome", ["success", "failure", "timeout", "inconclusive", "originally-stopped"])
 def test_supervisor_restores_exact_original_on_all_outcomes(settings, monkeypatch, outcome):
     supervisor = ops.Supervisor(settings)
+    supervisor.owner = "reef-nvfp4-8900-test-owner"
     fake = FakeDocker(settings, supervisor, running=outcome != "originally-stopped")
     monkeypatch.setattr(ops, "command", fake.command)
     monkeypatch.setattr(ops, "docker_inspect", fake.inspect)
@@ -170,7 +171,8 @@ def test_supervisor_restores_exact_original_on_all_outcomes(settings, monkeypatc
     assert fake.items["actor-id"]["State"]["Running"] is False
     assert not fake.other_stopped
     assert (settings.output / "learning/serving/actor-contract.json").exists()
-    assert not any("8900" in part for row in fake.calls for part in row)
+    publications = [row[row.index("-p") + 1] for row in fake.calls if "-p" in row]
+    assert publications == ["127.0.0.1:30001:8000"]
     if outcome == "success":
         assert events == ["create", "snapshot", "cycle", "verify-resume", "cycle", "rollback"]
 
