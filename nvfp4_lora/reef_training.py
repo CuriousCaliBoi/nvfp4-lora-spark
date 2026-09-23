@@ -128,15 +128,20 @@ class QuantizedTrainingRuntime(TrainingRuntime):
         with self._lock:
             rows = batch_rows(batch)
             incumbent = self._validated(self.incumbent_checkpoint)
+            stale = False
             for row in rows:
                 if serving_runtime_load_id is None or row["runtime_load_id"] != serving_runtime_load_id:
-                    raise StaleCandidate({"stale_native_rows": 1})
+                    stale = True
+                    continue
                 if (row["adapter_sha256"] != incumbent["adapter_sha256"] or
                         row["adapter_config_sha256"] != incumbent["files"]["adapter/adapter_config.json"] or
                         row["base_model"] != self._base_model or row["model_revision"] != self._revision):
                     raise ValueError("receipt does not belong to committed quantized policy")
                 if len(row["prompt_ids"]) + len(row["completion_ids"]) > self._config["max_model_len"]:
                     raise ValueError("native trajectory exceeds configured context")
+            if stale:
+                # REEF catches StaleCandidate around candidate execution, not preparation.
+                return PreparedTrainingStep("train", dict(algorithm_state), {"stale_native_rows": 1}, {"stale": True})
             signal = resolve_preparer(step_preparer)(batch, algorithm_state)
             if signal.loss_family != "nvfp4_grpo" or signal.advantages != advantages(rows):
                 raise ValueError("preparer does not match quantized GRPO contract")
@@ -151,6 +156,8 @@ class QuantizedTrainingRuntime(TrainingRuntime):
                                         {**job, "source_runtime_load_id": serving_runtime_load_id})
 
     def train_candidate(self, payload):
+        if payload.get("stale") is True:
+            raise StaleCandidate({"stale_native_rows": 1})
         with self._lock:
             job = {key: value for key, value in dict(payload).items() if key != "source_runtime_load_id"}
             expected = self._job("train")

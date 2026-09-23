@@ -14,7 +14,8 @@ from torch import nn
 
 pytest.importorskip("reef")
 from reef.core.records_types import AgentRecord, RequestType
-from reef.runtime.interfaces import StaleCandidate
+from reef.runtime.interfaces import InferenceRuntime, StaleCandidate
+from reef.train.runtime_backend import RuntimeCandidateBackend
 from reef.train.types import ProcessorContext
 
 from nvfp4_lora.reef_checkpoint import MANIFEST, content_hash, file_hash, validate_checkpoint
@@ -194,12 +195,39 @@ def test_stale_batch_and_single_writer(runtime_factory):
     with pytest.raises(ValueError, match="owner"):
         runtime_factory()
     actual = batch(validate_checkpoint(runtime.incumbent_checkpoint))
+    stale = runtime.prepare_training_step(actual, PREPARER, {}, 0, serving_runtime_load_id="runtime:two")
     with pytest.raises(StaleCandidate):
-        runtime.prepare_training_step(actual, PREPARER, {}, 0, serving_runtime_load_id="runtime:two")
+        runtime.train_candidate(stale.payload)
     payload = prepared(runtime).payload
     payload["parent_checkpoint_id"] = "e" * 64
     with pytest.raises(ValueError, match="identity"):
         runtime.train_candidate(payload)
+
+
+def test_actual_candidate_backend_drops_stale_and_accepts_later_valid_work(runtime_factory):
+    class Receiver(InferenceRuntime):
+        version = "runtime:two"
+
+        @property
+        def inference_handler(self):
+            return None
+
+        def serving_runtime_load_id(self):
+            return self.version
+
+    runtime = runtime_factory()
+    receiver = Receiver(base_url="http://unused")
+    backend = RuntimeCandidateBackend(runtime, PREPARER, inference_runtime=receiver, scenario="test")
+    actual = batch(validate_checkpoint(runtime.incumbent_checkpoint))
+    dropped = backend.prepare_step(actual, {"batches": 3}, 3)
+    assert dropped.outcome == "drop" and dropped.state == {"batches": 3}
+    assert int((runtime.state_root / "worker_calls").read_text()) == 1
+    receiver.version = "runtime:one"
+    receiver.mark_published()
+    valid = backend.prepare_step(actual, {"batches": 3}, 3)
+    assert valid.outcome == "candidate"
+    assert int((runtime.state_root / "worker_calls").read_text()) == 2
+    assert runtime.incumbent_checkpoint == runtime.base_checkpoint
 
 
 def test_failed_rollback_reconciles_authoritative_head_before_learning(runtime_factory):
