@@ -12,6 +12,8 @@ import math
 import os
 from pathlib import Path
 import random
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -41,6 +43,21 @@ def file_hash(path: Path) -> str:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def source_provenance() -> dict:
+    revision = os.environ.get("NVFP4_SOURCE_REVISION")
+    if revision:
+        if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", revision) is None:
+            raise ValueError("NVFP4_SOURCE_REVISION must be a full Git commit hash")
+        return {"code_revision": revision.lower(), "code_revision_source": "supervisor_env"}
+    executable = shutil.which("git")
+    if executable is not None:
+        result = subprocess.run([executable, "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return {"code_revision": result.stdout.strip(), "code_revision_source": "git"}
+    return {"code_revision": None, "code_revision_source": "unavailable"}
 
 
 def resource_snapshot() -> dict:
@@ -299,8 +316,7 @@ def run(args, output: Path) -> dict:
                 "reward": "flexible numeric GSM8K: final ####, boxed, or last number", "dropout": 0,
                 "enable_thinking": False,
                 "gradient_checkpointing": "non-reentrant", "initial_resources": resource_snapshot()}
-    code_revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True)
-    manifest["code_revision"] = code_revision.stdout.strip() if code_revision.returncode == 0 else None
+    manifest.update(source_provenance())
     write_json(output / "manifest.json", manifest)
     print("Loading the quantized learner", flush=True)
     model = build_quantized_learner(str(model_dir), lora_rank=args.lora_rank, lora_alpha=args.lora_alpha,

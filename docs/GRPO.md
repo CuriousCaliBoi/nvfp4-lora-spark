@@ -91,6 +91,9 @@ Artifacts include:
 - `manifest.json`: pinned snapshot identities, checkpoint metadata hashes,
   canonical dataset parquet hashes, software versions, original dataset row
   indices, trainable parameter audit, actor configuration, and arguments.
+  `NVFP4_SOURCE_REVISION` supplies the host-resolved commit for containers
+  without Git. Direct runs discover Git when available; otherwise the source
+  revision is explicitly `null` with source `unavailable`.
 - `gradient-gate.json`: all 48 attention adapter tensors have finite gradients,
   all 24 B tensors have nonzero gradients (A may be zero initially), unchanged adapter
   and frozen tensor checks, persistent storage accounting, memory.

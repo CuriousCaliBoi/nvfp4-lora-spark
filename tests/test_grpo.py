@@ -166,11 +166,37 @@ def test_prompt_disables_thinking():
     assert prompt_ids(Tokenizer(), "test") == [1, 2, 3]
 
 
-def test_runner_import_and_default_contract_without_vllm():
+def load_runner():
     path = Path(__file__).resolve().parents[1] / "scripts" / "train_grpo.py"
     spec = importlib.util.spec_from_file_location("train_grpo_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def test_source_provenance_without_git(monkeypatch):
+    module = load_runner()
+    monkeypatch.delenv("NVFP4_SOURCE_REVISION", raising=False)
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(module.subprocess, "run", lambda *a, **kw: pytest.fail("must not execute unavailable git"))
+    assert module.source_provenance() == {"code_revision": None, "code_revision_source": "unavailable"}
+    monkeypatch.setenv("NVFP4_SOURCE_REVISION", "")
+    assert module.source_provenance() == {"code_revision": None, "code_revision_source": "unavailable"}
+
+
+def test_source_provenance_prefers_supervisor_revision(monkeypatch):
+    module = load_runner()
+    revision = "a" * 40
+    monkeypatch.setenv("NVFP4_SOURCE_REVISION", revision)
+    monkeypatch.setattr(module.shutil, "which", lambda name: pytest.fail("supervisor revision needs no git lookup"))
+    assert module.source_provenance() == {"code_revision": revision, "code_revision_source": "supervisor_env"}
+    monkeypatch.setenv("NVFP4_SOURCE_REVISION", "unknown")
+    with pytest.raises(ValueError, match="full Git commit"):
+        module.source_provenance()
+
+
+def test_runner_import_and_default_contract_without_vllm():
+    module = load_runner()
     args = module.parse_args(["--model-dir", "/unused", "--output-dir", "/unused-output"])
     assert (args.batch_size, args.num_generations, args.steps, args.lora_rank) == (4, 8, 1, 8)
     assert args.max_batch_attempts == 3 and args.eval_size == 16 and args.temperature == 1.2
