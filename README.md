@@ -139,6 +139,12 @@ identical logprobs *prove* the adapter is a no-op; a moved delta proves it appli
 
 ## Local GRPO with Nemotron NVFP4
 
+For ordinary REEF serving and the frozen-quantized LoRA RL research workflow,
+including checkpoint continuation, restart and rollback checks, see
+[the local REEF guide](docs/REEF.md). The recorded DGX Spark campaign completed
+two accepted updates, a real service restart and rollback; its sixteen-row
+selection scores are a bounded validation, not a general accuracy claim.
+
 The experimental local GRPO route trains attention LoRA adapters against a frozen
 Nemotron NVFP4 checkpoint, using vLLM rollouts from the same checkpoint. See
 [the GRPO runner and learning contract](docs/GRPO.md) and

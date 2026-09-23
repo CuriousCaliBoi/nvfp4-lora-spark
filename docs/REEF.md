@@ -60,14 +60,14 @@ Prepare a JSON list of native token IDs for numerical verification, using this e
 
 ## Build the isolated research image
 
-The research image adds only the Python helper and call site from [upstream Marlin token-order PR 52532](https://github.com/vllm-project/vllm/pull/52532), pinned to commit `e8a07dcccf8e48dd4b9b42a355fc6d5b9db59073`. It orders routed tokens within complete contiguous expert regions, preserving expert assignment, padding and the single-token fast path. This is an unmerged diagnostic hypothesis; the existing native probability gates still determine whether this actor can enter the campaign.
+The research image adds only the Python helper and call site from [upstream Marlin token-order PR 52532](https://github.com/vllm-project/vllm/pull/52532), pinned to commit `e8a07dcccf8e48dd4b9b42a355fc6d5b9db59073`. It orders routed tokens within complete contiguous expert regions, preserving expert assignment, padding and the single-token fast path. This pinned patch passed the unchanged native gates locally with the recorded actor profile; that result does not establish global batch invariance or qualify other models and execution settings.
 
-Build from the committed experiment checkout with the pinned base image already present locally:
+The reusable image on nimitz is `reef-marlin-order:research-01`, immutable ID `sha256:2f0514d5fe0ab6413b4d9284e7d51462cd01c2ba5171e1c3ea8fd1f6c1215434`. Its build report is `/home/nimitz/projects/nvfp4-experiments/reef-marlin-image-20260922-01.json`. Reuse this pair when the reviewed build inputs match. To rebuild, choose a fresh image tag and report path from the committed experiment checkout:
 
 ```bash
 python3 scripts/build_reef_marlin_image.py \
   --repo /home/nimitz/projects/reef-nvfp4-integration \
-  --tag reef-marlin-order:research-01 \
+  --tag reef-marlin-order:research-02 \
   --output /absolute/fresh/marlin-build.json
 ```
 
@@ -84,7 +84,7 @@ cd /home/nimitz/projects/reef-nvfp4-integration
 REEF_PROXY_TOKEN_FILE=/home/nimitz/projects/nvfp4-experiments/reef-proxy-20260922-01/.token \
   scripts/run_spark_reef_cycle.sh \
   --image reef-marlin-order:research-01 \
-  --image-provenance /absolute/fresh/marlin-build.json \
+  --image-provenance /home/nimitz/projects/nvfp4-experiments/reef-marlin-image-20260922-01.json \
   --repo /home/nimitz/projects/reef-nvfp4-integration \
   --reef-repo /home/nimitz/projects/REEF \
   --reef-python /home/nimitz/projects/REEF/.venv/bin/python3 \
@@ -108,7 +108,7 @@ The owned actor uses 23% GPU allocation, eager execution, context 1024, no specu
 
 The conservative diagnostic profile disables asynchronous scheduling, limits the actor to one sequence, uses BF16 KV cache and `TRITON_ATTN`, and sets `CUBLAS_WORKSPACE_CONFIG=:4096:8`. Mamba cache mode is explicitly `none`; the Mamba backend remains FlashInfer. The actor contract records these settings from the inspected Docker command and environment. Frozen NVFP4 weights, Marlin, eager execution, context 1024, 23% memory allocation, disabled speculation/prefix caching and attention LoRA remain unchanged.
 
-This combined profile tests whether conservative execution settings eliminate the native probability discrepancy. It does not isolate a cause or demonstrate a fix before the native probes pass. All repeatability, parity, adapter-effect, reload and held-out acceptance thresholds remain unchanged.
+The conservative settings alone still failed repeatability checks. With the pinned Marlin patch, this profile passed the recorded bootstrap and trained-adapter checks. All repeatability, parity, adapter-effect, reload and held-out acceptance thresholds remain unchanged and run again for every campaign.
 
 Workers run as the host UID/GID, with read-only code/model mounts, offline Hugging Face settings and writable cache/home directories. The absolute `learning/checkpoints` path is identical in the CPU service, worker and actor; the actor receives it read-only. Each worker has a unique name, ownership label, CID file and registry entry. Only the supervisor controls production lifecycle.
 
@@ -126,6 +126,22 @@ The individual `create`, `cycle`, `snapshot`, `verify-resume` and `rollback` cli
 
 The run directory contains source/image provenance, immutable campaign binding, original container identity, actor attestation, worker registry, native receipts/reports, durable REEF commits, accepted checkpoint snapshots, restart/rollback proofs, result and restoration evidence. Each checkpoint includes standard PEFT weights, native LoRA tensors, AdamW, RNG, metrics and a hash manifest. `serving-state.json` binds the published head to native probability probes; API registry acknowledgement alone is insufficient.
 
+Run07 (`/home/nimitz/projects/nvfp4-experiments/reef-cycle-20260922-07`) completed two real REEF feedback-to-training-to-commit updates, a CPU service restart, continued optimizer state and rollback to the first accepted checkpoint. It used source `fa20c094e9525fa5b8cf6c75752c6683378a6590` and the exact `research-01` image recorded above. The frozen tensor hash stayed unchanged. Each update consumed 32 actual captured rollouts and changed the attention adapters.
+
+| Checkpoint | Optimizer step | Strict held-out correct |
+| --- | --- | --- |
+| Bootstrap `4a422de90ad6e899` | 0 | 14/16 |
+| Accepted `22d4240e09fa51e2` | 1 | 15/16 |
+| Accepted `c045364f4ebcfc40` | 2 | 15/16 |
+
+These sixteen rows were used for candidate selection; the scores do not establish a general accuracy gain. Each evaluated checkpoint had one length-limited response scored incorrect. Native adapter effects reached 0.936278 and 0.490211 log-probability difference for the two updates; every measured null, repeat and reload difference was zero under the unchanged gates.
+
+The real CPU REEF restart changed PID 760272 to 765703 and the serving runtime incarnation; the GPU actor stayed running. Comparing `campaign/accepted-1.json` with `resume-proof.json`'s `after` snapshot preserves the checkpoint and all six payload hashes, including optimizer and RNG state. Both snapshots inside `resume-proof.json` are post-restart; they alone are not a before/after restart comparison. The subsequent update advanced the optimizer from 1 to 2. `rollback-proof.json` then records restoration of the first accepted checkpoint and all six original payload hashes, returning optimizer step 2 to 1 with a new published runtime identity and the prior verified native binding. Rollback was not a third training update or a fresh nine-probe run.
+
+Run07's `restoration.json` confirms healthy production restoration with an empty error list and the exact original container ID `67fc87bb3e3858e200bcaea09ee0741a26bcae60ccb2ade7335ad453c20f4db1`. Total supervised runtime including restoration was 1,923.49 seconds. The learned adapter was not deployed onto production.
+
+Run06 had already verified one real frozen-NVFP4 update and native adapter gates, but stopped at the restart port probe. It is partial evidence; the complete continuation and rollback evidence belongs to run07.
+
 Treat the bounded learning campaign as unvalidated until `result.json` records `status: complete`, two accepted optimizer increments, and verified restart/rollback, with matching underlying checkpoint, commit and native probe evidence. A successfully constructed bootstrap is still optimizer step zero. For this rank8/alpha16 configuration it contains 933,888 trainable attention-LoRA parameters; successful allocation, checkpoint export or a low memory peak does not demonstrate adapter compatibility or an accepted learning update.
 
 Inspect `result.json` together with `restoration.json`. A complete learning result is not a successful handoff unless restoration is healthy. Early failures may have `failure.json` without `result.json`; missing completion evidence must never be interpreted as success. Sanitize credentials and generated runtime configuration before sharing evidence. Raw generated state is not a deliverable.
@@ -135,6 +151,8 @@ Learning currently supports one scenario, buffered text chat, one choice, this f
 ## Startup and native verification diagnostics
 
 If the actor exits before becoming healthy, the supervisor stops waiting immediately and records `actor-startup-failure.json` with the owned container ID, image ID and Docker exit state. Inspect that file and the retained `reef-nvfp4-*-actor.log`. Argument-parser failures occur before model loading; the vLLM 0.27.1 command uses `--no-enable-log-requests`. Use the pinned image's actual help when investigating incompatible flags.
+
+A stopped REEF listener can leave TCP connections in `TIME_WAIT`. The original restart probe used a plain bind, while REEF's `aiohttp.web.run_app` inherits asyncio's POSIX `SO_REUSEADDR` setting. A real socket regression reproduced that false rejection. The probe now matches the server's reuse behavior and tests listening; a short connection check still rejects active listeners, including wildcard listeners on BSD/macOS. An address-in-use error from an active service remains blocking.
 
 If REEF initialization fails, inspect `reef-first.log`, `failure.json`, and `learning/jobs/bootstrap-*.log`. Completed bootstrap bytes live under `learning/checkpoints/<checkpoint_id>` and can establish that the frozen quantized learner and zero-delta adapter were constructed, even when subsequent actor verification fails. A zero-LoRA-versus-base probability mismatch is a native verification failure, not a training update. Preserve its probe evidence and diagnose the discrepancy without widening the tolerance or bypassing the gate.
 
