@@ -126,7 +126,7 @@ def behavior_metrics(old: Tensor, behavior: Tensor, mask: Tensor, tis_min=0.1, t
 
 
 _NUMBER = r"[-+]?(?:(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?|\.[0-9]+)"
-_FINAL = re.compile(r"^[ \t]*####[ \t]*(" + _NUMBER + r")[ \t]*\s*\Z", re.MULTILINE)
+_FINAL = re.compile(r"^[ \t]*####[ \t]*(" + _NUMBER + r")\.?\s*\Z", re.MULTILINE)
 
 
 def _final_number(text: str) -> Decimal | None:

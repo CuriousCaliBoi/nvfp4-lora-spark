@@ -313,7 +313,7 @@ def run(args, output: Path) -> dict:
                 "versions": versions, "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(),
                 "objective": "one-epoch sample-mean clipped GRPO; detached token-clipped old-learner/behavior correction",
                 "policy_temperature": args.temperature, "behavior_logprobs": "vllm_processed_logprobs",
-                "reward": "strict final-line GSM8K: #### <number>; no fallback", "dropout": 0,
+                "reward": "strict final-line GSM8K: #### <number> with optional terminal period; no fallback", "dropout": 0,
                 "enable_thinking": False,
                 "gradient_checkpointing": "non-reentrant", "initial_resources": resource_snapshot()}
     manifest.update(source_provenance())

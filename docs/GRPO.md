@@ -82,8 +82,8 @@ Sixteen held-out `test` rows are selected before training using seed 43 and
 evaluated greedily before and after. Thinking is disabled in the chat template;
 the prompt asks for a concise calculation followed by `#### <number>`. The
 verifier requires the final nonempty line to contain only `#### <number>`.
-It accepts whitespace, signed numbers, valid thousands separators, and decimal
-values. A boxed answer, a trailing number in unfinished reasoning, or a final
+It accepts whitespace, signed numbers, valid thousands separators, decimal
+values, and an optional terminal period. A boxed answer, a trailing number in unfinished reasoning, or a final
 answer followed by prose receives zero reward. The current verifier has no
 fallback; the [recorded smoke report](GRPO_SMOKE.md) distinguishes its historical
 permissive scores from an offline audit using this stricter contract.
