@@ -68,7 +68,7 @@ class _DequantLinear(torch.autograd.Function):
     def forward(ctx, x, weight_uint8, weight_scale_fp8, weight_scale_2_fp32, group_size: int, w_bf16_workspace, format: str):
         ctx.save_for_backward(weight_uint8, weight_scale_fp8, weight_scale_2_fp32)
         ctx.group_size = group_size
-        ctx.w_bf16_workspace = w_bf16_workspace.detach()
+        ctx.w_bf16_workspace = None if w_bf16_workspace is None else w_bf16_workspace.detach()
         ctx.format = format
         W_bf16 = dequantize_nvfp4_weight(
             weight_uint8, weight_scale_fp8, weight_scale_2_fp32,
@@ -141,6 +141,7 @@ class NVFP4LoRALinear(nn.Module):
         self.lora_alpha = lora_alpha
         self.lora_scale = (lora_alpha / r) if r > 0 else 0.0
         self.dtype = dtype
+        self.cache_dequant = True
         self.w_bf16_workspace: Optional[torch.Tensor] = None
 
         # Frozen NVFP4 base (register as buffers, not Parameters - never trained, never saved by optimizer)
@@ -195,7 +196,14 @@ class NVFP4LoRALinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Base path: training uses custom autograd (dequant recomputed in backward, no bf16 shadow saved);
         # eval uses a lazily-materialized bf16 weight cache for fast `F.linear`.
-        if self.training:
+        if not self.cache_dequant:
+            # Policy scoring also needs recomputation in eval mode: retaining a dense
+            # weight here would accumulate a second base model across scoring passes.
+            y = _DequantLinear.apply(
+                x, self.weight_uint8, self.weight_scale_fp8, self.weight_scale_2_fp32,
+                self.group_size, None, self.nvfp4_format,
+            )
+        elif self.training:
             cached = self._train_cached_weight(x.dtype)
             if cached is not None:
                 # Frozen resident bf16 weight: autograd gives dx = dy @ W and no grad to W,
@@ -380,7 +388,7 @@ class _FP8DequantLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight_fp8, weight_scale):
         ctx.save_for_backward(weight_fp8, weight_scale)
-        W = weight_fp8.to(x.dtype) * weight_scale.to(x.dtype)
+        W = _decode_fp8(weight_fp8, weight_scale, x.dtype)
         return F.linear(x, W, bias=None)
 
     @staticmethod
@@ -388,9 +396,16 @@ class _FP8DequantLinear(torch.autograd.Function):
         weight_fp8, weight_scale = ctx.saved_tensors
         grad_x = None
         if ctx.needs_input_grad[0]:
-            W = weight_fp8.to(grad_output.dtype) * weight_scale.to(grad_output.dtype)
+            W = _decode_fp8(weight_fp8, weight_scale, grad_output.dtype)
             grad_x = grad_output @ W
         return grad_x, None, None
+
+
+def _decode_fp8(weight_fp8, weight_scale, dtype):
+    # Rounding the stored FP32 scale to BF16 before multiplication changes the
+    # reconstructed base; cast only after applying the original scale.
+    compute_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    return (weight_fp8.to(compute_dtype) * weight_scale.to(compute_dtype)).to(dtype)
 
 
 class FP8LoRALinear(nn.Module):
