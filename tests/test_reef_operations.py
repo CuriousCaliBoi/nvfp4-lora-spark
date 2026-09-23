@@ -328,3 +328,102 @@ def test_factory_rejects_unsupported_runtime_configuration(tmp_path, key, value)
     config[key] = value
     with pytest.raises(ValueError):
         deployment.runtime_settings(config)
+
+
+def snapshot_fixture(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    values = {"identity": "old", "step": 1}
+    manifests = {}
+    def publish(identity, step):
+        path = state / "checkpoints" / identity
+        path.mkdir(parents=True, exist_ok=True)
+        manifest = {"checkpoint_id": identity, "optimizer_step": step, "adapter_sha256": "weights-" + identity,
+                    "files": {"adapter/adapter_config.json": "config-" + identity, "optimizer.pt": "opt-" + identity}}
+        manifests[str(path.resolve())] = manifest
+        values.update(identity=identity, step=step)
+        campaign.write_json(state / "incumbent.json", {"checkpoint_id": identity, "checkpoint_path": str(path)})
+        campaign.write_json(state / "serving/serving-state.json", {
+            "active_checkpoint_id": identity, "fenced": False, "pending": None,
+            "published_runtime_load_id": "runtime-" + identity, "active_release": "release-" + identity,
+            "bindings": {identity: {"native_verified": True, "adapter_sha256": "weights-" + identity,
+                "adapter_config_sha256": "config-" + identity, "reload_max_delta": 0,
+                "adapter_effect_max_delta": 0.1, "reference_repeat_max_delta": 0}},
+        })
+    def status():
+        identity = values["identity"]
+        return {"scenarios": {"research": {"scenario_step": values["step"],
+                "artifact_head_sync": {"state": "synchronized", "release_id": "release-" + identity},
+                "current_runtime_load_id": "runtime-" + identity, "inference_admission": {"open": True, "active": 0}}}}
+    def releases():
+        return {"releases": [{"current": True, "release_id": "release-" + values["identity"]}]}
+    module = ModuleType("nvfp4_lora.reef_checkpoint")
+    module.validate_checkpoint = lambda path: manifests[str(path)]
+    monkeypatch.setitem(sys.modules, "nvfp4_lora.reef_checkpoint", module)
+    publish("old", 1)
+    return state, values, module, publish, status, releases
+
+
+def test_snapshot_retries_when_publication_changes_during_checkpoint_read(tmp_path, monkeypatch):
+    state, values, module, publish, status, releases = snapshot_fixture(tmp_path, monkeypatch)
+    original_validate = module.validate_checkpoint
+    reads = []
+    def validate(path):
+        manifest = original_validate(path)
+        reads.append(manifest["checkpoint_id"])
+        if len(reads) == 1:
+            publish("new", 2)
+        return manifest
+    module.validate_checkpoint = validate
+    class Client:
+        def get(self, path, **kwargs):
+            return status() if path == "/reef/status" else releases()
+    result = campaign.snapshot(Client(), "research", state, timeout=1)
+    assert reads == ["old", "new"]
+    assert result["checkpoint"]["checkpoint_id"] == "new"
+    assert result["status"]["current_runtime_load_id"] == "runtime-new"
+    assert result["release"]["release_id"] == "release-new"
+
+
+def test_commit_visibility_does_not_count_as_settlement(tmp_path, monkeypatch):
+    state, values, module, publish, status, releases = snapshot_fixture(tmp_path, monkeypatch)
+    directory = tmp_path / "evidence"
+    directory.mkdir()
+    events = []
+    reads = 0
+    class Client:
+        def get(self, path, **kwargs):
+            nonlocal reads
+            if "/commits?" in path:
+                events.append("durable-row-visible")
+                return {"commits": [{"step": 2, "pending": False, "consumed_ids": ["report"]}]}
+            if path.endswith("/releases"):
+                return releases()
+            reads += 1
+            if reads == 4:
+                publish("new", 2)
+                events.append("publication-acknowledged")
+            return status()
+    result = campaign.await_commit(Client(), "research", ["report"], 1,
+                                   campaign.time.monotonic() + 2, directory, state_root=state)
+    assert result["step"] == 2
+    assert events == ["durable-row-visible", "publication-acknowledged"]
+    settled = campaign.read_json(directory / "settled.json")
+    assert settled["status"]["scenario_step"] == 2
+    assert settled["serving"]["published_runtime_load_id"] == "runtime-new"
+
+
+def test_snapshot_never_invents_acknowledgement_when_publication_stays_pending(tmp_path, monkeypatch):
+    state, values, module, publish, status, releases = snapshot_fixture(tmp_path, monkeypatch)
+    now = [0.0]
+    monkeypatch.setattr(campaign.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(campaign.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    class Client:
+        def get(self, path, **kwargs):
+            if "/commits?" in path:
+                return {"commits": [{"step": 2, "pending": False, "consumed_ids": ["report"]}]}
+            return status() if path == "/reef/status" else releases()
+    directory = tmp_path / "evidence"
+    with pytest.raises(TimeoutError, match="no settled REEF publication"):
+        campaign.await_commit(Client(), "research", ["report"], 1, 0.3, directory, state_root=state)
+    assert not (directory / "settled.json").exists()
+    assert campaign.read_json(state / "incumbent.json")["checkpoint_id"] == "old"

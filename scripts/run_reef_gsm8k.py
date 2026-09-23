@@ -53,16 +53,16 @@ class ReefHTTP:
             raise ValueError("endpoint cannot contain credentials or query parameters")
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
 
-    def request(self, path, payload=None, scenario=None):
+    def request(self, path, payload=None, scenario=None, *, timeout=None):
         headers = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
         if scenario:
             headers["x-reef-scenario"] = scenario
         body = None if payload is None else json.dumps(payload, allow_nan=False).encode()
-        with urlopen(Request(self.url + path, data=body, headers=headers), timeout=self.timeout) as response:
+        with urlopen(Request(self.url + path, data=body, headers=headers), timeout=timeout or self.timeout) as response:
             return json.load(response), dict(response.headers)
 
-    def get(self, path):
-        return self.request(path)[0]
+    def get(self, path, *, timeout=10):
+        return self.request(path, timeout=min(timeout, self.timeout))[0]
 
 
 def scenario_path(scenario):
@@ -136,17 +136,42 @@ def learning_request(row, seed):
             "logit_bias": {}, "seed": seed, "chat_template_kwargs": {"enable_thinking": False}}
 
 
-def snapshot(client, scenario, state_root):
-    from nvfp4_lora.reef_checkpoint import validate_checkpoint
+class SnapshotPending(RuntimeError):
+    pass
 
-    status = client.get("/reef/status")
+
+def _scenario_status(status, scenario):
     if status.get("error") or status.get("preload_errors"):
         raise RuntimeError("REEF reports a runtime error; see retained status evidence")
-    current = status["scenarios"][scenario]
-    releases = client.get(scenario_path(scenario) + "/releases")["releases"]
+    return status["scenarios"][scenario]
+
+
+def _status_identity(current):
+    return {key: current.get(key) for key in (
+        "scenario_step", "artifact_head_sync", "current_runtime_load_id", "inference_admission",
+    )}
+
+
+def _snapshot_once(client, scenario, state_root, deadline, minimum_step):
+    from nvfp4_lora.reef_checkpoint import validate_checkpoint
+
+    def get(path):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SnapshotPending("snapshot read budget expired")
+        return client.get(path, timeout=min(5, remaining))
+
+    releases = get(scenario_path(scenario) + "/releases")["releases"]
+    current = _scenario_status(get("/reef/status"), scenario)
     heads = [row for row in releases if row.get("current")]
     if len(heads) != 1 or not current.get("current_runtime_load_id"):
-        raise RuntimeError("REEF has no unique published serving head")
+        raise SnapshotPending("REEF has no unique published serving head")
+    if (current["scenario_step"] < minimum_step
+            or current.get("artifact_head_sync", {}).get("state") != "synchronized"
+            or current["artifact_head_sync"].get("release_id") != heads[0]["release_id"]
+            or current.get("inference_admission", {}).get("open") is not True):
+        raise SnapshotPending("REEF has not settled the durable head and reopened admission")
+    serving = read_json(state_root / "serving" / "serving-state.json")
     incumbent = read_json(state_root / "incumbent.json")
     path = Path(incumbent["checkpoint_path"]).resolve()
     if not path.is_relative_to((state_root / "checkpoints").resolve()):
@@ -154,14 +179,20 @@ def snapshot(client, scenario, state_root):
     manifest = validate_checkpoint(path)
     if manifest["checkpoint_id"] != incumbent["checkpoint_id"]:
         raise ValueError("incumbent pointer and checkpoint identity disagree")
-    serving = read_json(state_root / "serving" / "serving-state.json")
-    binding = serving["bindings"][manifest["checkpoint_id"]]
+    serving_after = read_json(state_root / "serving" / "serving-state.json")
+    incumbent_after = read_json(state_root / "incumbent.json")
+    current_after = _scenario_status(get("/reef/status"), scenario)
+    releases_after = get(scenario_path(scenario) + "/releases")["releases"]
+    if (serving_after != serving or incumbent_after != incumbent or releases_after != releases
+            or _status_identity(current_after) != _status_identity(current)):
+        raise SnapshotPending("publication changed while reading the snapshot")
     if serving["fenced"] or serving["active_checkpoint_id"] != manifest["checkpoint_id"]:
-        raise RuntimeError("native actor is fenced or differs from the committed learner")
+        raise SnapshotPending("native actor is fenced or differs from the committed learner")
     if serving["published_runtime_load_id"] != current["current_runtime_load_id"]:
-        raise RuntimeError("REEF and native actor runtime identities disagree")
+        raise SnapshotPending("REEF and native actor runtime identities disagree")
     if serving["active_release"] != heads[0]["release_id"] or serving["pending"] is not None:
-        raise RuntimeError("native actor does not bind the durable published release")
+        raise SnapshotPending("native actor does not bind the durable published release")
+    binding = serving["bindings"][manifest["checkpoint_id"]]
     if not binding["native_verified"] or binding["adapter_sha256"] != manifest["adapter_sha256"]:
         raise RuntimeError("native verification does not bind the committed adapter")
     if binding["adapter_config_sha256"] != manifest["files"]["adapter/adapter_config.json"]:
@@ -172,6 +203,18 @@ def snapshot(client, scenario, state_root):
         raise RuntimeError("trained adapter lacks measurable native effect")
     return {"scenario": scenario, "status": current, "release": heads[0], "checkpoint": manifest,
             "checkpoint_path": str(path), "serving": serving, "captured_unix": time.time()}
+
+
+def snapshot(client, scenario, state_root, *, timeout=30, minimum_step=0):
+    deadline = time.monotonic() + timeout
+    reason = "no coherent snapshot observed"
+    while time.monotonic() < deadline:
+        try:
+            return _snapshot_once(client, scenario, state_root, deadline, minimum_step)
+        except (SnapshotPending, TimeoutError) as exc:
+            reason = str(exc)
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    raise TimeoutError("REEF publication did not settle: " + reason)
 
 
 def verify_continuation(before, after, *, restarted=False):
@@ -225,7 +268,7 @@ def collect_and_report(client, scenario, declaration, directory, before):
     return report_ids
 
 
-def await_commit(client, scenario, report_ids, after_step, deadline, directory):
+def await_commit(client, scenario, report_ids, after_step, deadline, directory, *, state_root):
     while time.monotonic() < deadline:
         status = client.get("/reef/status")
         write_json(directory / "latest-status.json", status)
@@ -238,9 +281,17 @@ def await_commit(client, scenario, report_ids, after_step, deadline, directory):
         if len(matching) > 1:
             raise RuntimeError("the same complete report batch was consumed more than once")
         if matching and not matching[0]["pending"]:
-            return matching[0]
-        time.sleep(2)
-    raise TimeoutError("no durable REEF commit consumed the complete declared report batch")
+            try:
+                settled = snapshot(client, scenario, state_root,
+                                   timeout=min(5, max(0, deadline - time.monotonic())),
+                                   minimum_step=matching[0]["step"])
+            except TimeoutError:
+                settled = None
+            if settled is not None:
+                write_json(directory / "settled.json", settled)
+                return matching[0]
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    raise TimeoutError("no settled REEF publication consumed the complete declared report batch")
 
 
 def cycle(args, client):
@@ -279,7 +330,7 @@ def cycle(args, client):
             write_json(directory / "declaration.json", declaration)
         report_ids = collect_and_report(client, args.scenario, declaration, directory, before)
         commit = await_commit(client, args.scenario, report_ids, before["status"]["scenario_step"],
-                              time.monotonic() + args.timeout, directory)
+                              time.monotonic() + args.timeout, directory, state_root=args.state_root)
         current = snapshot(client, args.scenario, args.state_root)
         manifest = current["checkpoint"]
         accepted = manifest["optimizer_step"] == args.target_step
