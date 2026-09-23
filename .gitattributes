@@ -1,0 +1,2 @@
+# Unified-diff context lines contain a required space; preserve the pinned bytes.
+nvfp4_lora/vendor/marlin_order.patch whitespace=-blank-at-eol
